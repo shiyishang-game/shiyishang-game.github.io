@@ -345,7 +345,7 @@ function barRow(parent, name, value, max, cls, side) {
   parent.appendChild(r);
 }
 
-function drawFunnel(visits, ev) {
+function drawFunnel(opens, ev) {
   clear(secFunnel);
   const hd = h('h2', '', '玩家走到哪一步');
   hd.appendChild(h('small', '', '按次数，不是人数'));
@@ -358,13 +358,13 @@ function drawFunnel(visits, ev) {
     const e = story.ends[k.slice(3)];
     if (e && (e.kind === 'prologue' || e.kind === 'hidden')) good += ev[k];
   });
-  const steps = [['打开页面', visits], ['点「进入」', ev['开始'] || 0], ['选了世一上', sum('选人·')], ['打出结局', sum('结局·')], ['打出序章/隐藏', good]];
-  const top = Math.max(1, steps[0][1], steps[1][1]);
+  const steps = [['打开页面', opens], ['点「进入」', ev['开始'] || 0], ['选了世一上', sum('选人·')], ['打出结局', sum('结局·')], ['打出序章/隐藏', good]];
+  const top = Math.max(1, ...steps.map(function (s) { return s[1]; }));
   steps.forEach(function (s, i) {
-    barRow(box, s[0], s[1], top, i === 4 ? 'k-prologue' : '', i ? pct(s[1], steps[0][1]) : '');
+    barRow(box, s[0], s[1], top, i === 4 ? 'k-prologue' : '', i === 1 || i === 2 ? pct(s[1], steps[0][1]) : '');
   });
   secFunnel.appendChild(box);
-  secFunnel.appendChild(h('p', 'note', '读档继续不算「进入」；同一个人多次打开会算多次。'));
+  secFunnel.appendChild(h('p', 'note', '百分比 = 占打开页面的比例。读档继续不算「进入」；一次「进入」后重开本线、读档还能再打出结局，所以结局数可以比进入多。'));
 }
 
 function drawPick(ev) {
@@ -400,7 +400,7 @@ function drawMisc(ev, stats) {
   const got = Object.keys(ev).filter(function (k) { return k.indexOf('结局·') === 0 && story.ends[k.slice(3)]; }).length;
   add('读档（回到过去重来）', ev['读档'] || 0);
   add('生成分享海报', ev['海报'] || 0);
-  add('每人平均打开', stats.visitors ? (stats.visits / stats.visitors).toFixed(1) + ' 次' : '—');
+  add('每人平均打开', stats.visitors ? (stats.pageviews / stats.visitors).toFixed(1) + ' 次' : '—');
   add('每次「进入」平均打出结局', ev['开始'] ? (ends / ev['开始']).toFixed(1) + ' 个' : '—');
   add('平均停留', stats.visits ? Math.round(stats.totaltime / stats.visits / 60 * 10) / 10 + ' 分钟' : '—');
   add('玩家打出过的结局种类', got + ' / ' + (story.total || '?'));
@@ -515,11 +515,11 @@ async function refresh() {
     const vs = range.id === 'today' ? '比昨天' : '比上一段';
     kpi('正在玩（5 分钟内）', active == null ? '—' : active, null, 'live');
     kpi(range.name + '玩家', stats.visitors, range.id === 'all' ? null : delta(stats.visitors, prev && prev.visitors, vs));
-    kpi('打开次数', stats.visits, range.id === 'all' ? null : delta(stats.visits, prev && prev.visits, vs));
+    kpi('打开次数', stats.pageviews, range.id === 'all' ? null : delta(stats.pageviews, prev && prev.pageviews, vs));
     kpi('点「进入」', ev['开始'] || 0, null);
     kpi('打出结局', Object.keys(ev).reduce(function (a, k) { return a + (k.indexOf('结局·') === 0 ? ev[k] : 0); }, 0), null);
     drawTrend(res[1].status === 'fulfilled' ? res[1].value : null, t0, now);
-    drawFunnel(stats.visits, ev);
+    drawFunnel(stats.pageviews, ev);
     drawPick(ev);
     drawMisc(ev, stats);
     drawEnds(ev);
