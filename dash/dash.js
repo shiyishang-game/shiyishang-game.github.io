@@ -284,13 +284,9 @@ function delta(cur, prev, label) {
   return d;
 }
 
+// 请求时带了 timezone=Asia/Shanghai，Umami 返回的时间已经是北京时间，只是末尾仍挂着 Z（实测 10/31），所以按字面取，不再换算。
 function bucketKey(x, unit) {
-  let s = String(x);
-  if (/[zZ]$|[+-]\d\d:?\d\d$/.test(s)) {           // 带时区的时间戳：换成北京时间再取
-    const t = Date.parse(s);
-    if (!isNaN(t)) s = new Date(t + TZ_MS).toISOString();
-  }
-  s = s.replace('T', ' ');
+  const s = String(x).replace('T', ' ');
   return unit === 'hour' ? s.slice(0, 13) : s.slice(0, 10);
 }
 
