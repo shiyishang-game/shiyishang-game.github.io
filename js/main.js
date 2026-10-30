@@ -4,6 +4,7 @@ import * as store from './store.js';
 import * as audio from './audio.js';
 import { attachDrag, attachKeys } from './swipe.js';
 import { makePoster } from './poster.js';
+import { initStats, pageview, track } from './stats.js';
 
 const KIND_NAME = { death: '作死结局', prologue: '序章结局', if: 'IF · 平行番外', hidden: '隐藏结局' };
 const FLY_MS = 220;
@@ -15,6 +16,8 @@ const ABOUT_LINES = [
   '同人 · 非官方 · 非商业。与 Riot Games、腾讯及各战队无关。',
   '代码 MIT；剧本文字 CC BY-NC-SA 4.0；剧集画面与原声版权归原作者，不在开源许可范围内。',
 ];
+/** 统计说明（关于本作最后一段）。 */
+const PRIVACY_LINE = '本站用 Umami 做匿名访问统计：不用 Cookie，不收集任何个人信息，只数打开次数、选了谁、打出了哪些结局；浏览器开了“请勿追踪”就不统计。';
 const FRAME_ASPECT = { min: 1.4, max: 2.4 };   // 宽帧/结局图的盒子比例跟随原图，但夹在这个范围内
 // 抉择卡（有 L/R 选项的卡）必须点选项按钮才算选；滑动只会让卡片轻晃一下并弹回
 const LOCK_MS = 500;                           // 抉择卡出现后这段时间内不接受选择（防连点、防残余手势）
@@ -126,6 +129,7 @@ const ui = {
   cardEl: null, stampEl: null, meterEls: {}, previews: {},
   kbN: null, savedStatus: 'none', savedRun: null,
   menuBackup: null,   // 从菜单“返回选人”时暂存的本局，选人页点“返回游戏”可恢复
+  resumed: false,     // 正在恢复存档里的当前卡（结局页不重复记统计）
   opts: [],           // 当前卡的选项（engine.options()）
   choice: false,      // 当前卡是抉择卡（有 L/R）；false = 叙事卡（只有“继续”）
   choiceList: [],     // 抉择卡的选项按钮 [{ el, sel, dir }]，顺序 = 键盘高亮顺序
@@ -162,6 +166,9 @@ function boot() {
   } catch (e) { /* ignore */ }
 
   if (ui.rec) document.body.classList.add('rec');
+  // 匿名统计（只在正式网址上；录屏 / debug / 请勿追踪不发），详见 stats.js
+  initStats({ rec: ui.rec, debug: DEBUG });
+  pageview();
   buildDom();
   layout();
   window.addEventListener('resize', layout);
@@ -334,6 +341,7 @@ function showTitle() {
 }
 
 function startNew() {
+  track('开始');
   const res = ui.engine.startLine('common');
   enterGame();
   render(res);
@@ -343,7 +351,9 @@ function continueRun() {
   const e = ui.engine;
   if (ui.savedStatus === 'ok') {
     enterGame();
+    ui.resumed = true;                    // 接着上次的结局页：不再记一次结局
     render(e.current());
+    ui.resumed = false;
     return;
   }
   // outdated：剧情已更新，从本线开头开始
@@ -922,6 +932,8 @@ function showSelect() {
 }
 
 function becomeHim(id) {
+  const ln = ui.story.lines[id];
+  track('选人·' + ((ln && ln.name) || id), { line: id });
   const res = ui.engine.startLine(id);
   enterGame();
   render(res);
@@ -964,6 +976,7 @@ function showNews() {
 
 // ---------- 结局屏 ----------
 function showEnd(info, card) {
+  if (!ui.resumed) track('结局·' + info.title, { id: card.id, line: info.line, kind: info.kind });
   setScreen('end');
   setBg(card.img);
   const root = els.end;
@@ -1005,6 +1018,7 @@ function showEnd(info, card) {
 
 /** 「从那里重来」：回到错过相遇的那个存档点，带上引路——一路上该选的选项会亮 ✦ 角标，直到遇见为止。 */
 function rewindGuided(m) {
+  track('读档', { how: '引路', meet: m.meet });
   const res = ui.engine.restore(m.histIndex, { meet: m.meet, path: m.path });
   enterGame();
   render(res);
@@ -1032,6 +1046,7 @@ function openRewind() {
 
 /** 读档：回到 hist 里的那个抉择点（不带引路），回到游戏屏。 */
 function rewindTo(p) {
+  track('读档', { how: '面板' });
   const res = ui.engine.restore(p.histIndex);
   enterGame();
   render(res);
@@ -1078,6 +1093,7 @@ function openGallery() {
 }
 
 function openPoster(info) {
+  track('海报', { line: info.line });
   const box = h('div', 'posterbox');
   box.appendChild(h('div', 'phint', '正在生成海报…'));
   openModal(box);
@@ -1114,6 +1130,7 @@ function openAbout() {
   const sheet = h('div', 'sheet about');
   sheet.appendChild(h('h3', '', '关于本作'));
   ABOUT_LINES.forEach(function (t) { sheet.appendChild(h('p', 'about-p', t)); });
+  sheet.appendChild(h('p', 'about-privacy', PRIVACY_LINE));
   sheet.appendChild(button('btn close', '关闭', closeModal));
   openModal(sheet);
 }
