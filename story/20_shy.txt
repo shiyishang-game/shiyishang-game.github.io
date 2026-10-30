@@ -318,8 +318,8 @@ L: 硬接 | 战力-25 -> shy.028
 R: 闪 | 战力-10 -> shy.028
 
 == shy.028
-if: {分力}
-else: shy.end.rash
+if: {分力} 人气>=50
+else: shy.028x
 img: d/e15_0515_3
 who: 姜爷
 say: 宙斯，你难道不好奇，其他的韩门成员去哪里了吗？
@@ -346,6 +346,14 @@ say: 你是神王，我是武圣。王或许可以靠着实力称霸一方，
   但只有带领众人飞升者，才能称之为圣。
 sfx: v/e15_0559_0-0606_0
 next: shy.end.saint
+
+== shy.028x
+if: {分力}
+else: shy.end.rash
+mode: text
+say: 你把武圣之力分了出去。
+  可是到了这一天，没有一个人赶来。——撸城的人，已经不信你了。
+next: shy.end.rash
 
 # ---------- 结局 ----------
 == shy.end.saint

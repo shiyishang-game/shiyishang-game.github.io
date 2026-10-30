@@ -351,11 +351,19 @@ R: “打了才知道。领域展开！” -> bin.037
 P【DRX·U盘】: 插上 DRX·U盘，三小时，一辈子一次 | 战力+40 -【DRX·U盘】 -> bin.end.gold
 
 == bin.037
-if: 战力>=60
-else: bin.end.weak
+if: 战力>=60 暴露度<=50
+else: bin.037x
 mode: text
 say: 你的实力，已经藏了三年。
 next: bin.end.gold
+
+== bin.037x
+if: 战力>=60
+else: bin.end.weak
+mode: text
+say: 杰克爱笑了：“世一上，你这三年，藏得一点都不好。”
+  你的每一招，他都研究过了。
+next: bin.end.exposed
 
 # ---------- 结局 ----------
 == bin.end.gold

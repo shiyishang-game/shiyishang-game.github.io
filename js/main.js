@@ -16,6 +16,11 @@ const ABOUT_LINES = [
   '代码 MIT；剧本文字 CC BY-NC-SA 4.0；剧集画面与原声版权归原作者，不在开源许可范围内。',
 ];
 const FRAME_ASPECT = { min: 1.4, max: 2.4 };   // 宽帧/结局图的盒子比例跟随原图，但夹在这个范围内
+// 抉择卡（有 L/R 选项的卡）必须点选项按钮才算选；滑动只会让卡片轻晃一下并弹回
+const LOCK_MS = 500;                           // 抉择卡出现后这段时间内不接受选择（防连点、防残余手势）
+const DRAG_CAP = 28;                           // 抉择卡上拖拽时卡片最多跟手移动的像素
+const HINT_DRAG_PX = 24;                       // 抉择卡上拖过这么远松手才弹提示
+const CHOICE_HINT = '这是一道选择题——点下面的选项';
 let DEBUG = false;   // ?debug=1：占位图上显示素材 key（只给作者用）
 
 // ---------- 小工具 ----------
@@ -111,6 +116,12 @@ const ui = {
   cardEl: null, stampEl: null, meterEls: {}, previews: {},
   kbN: null, savedStatus: 'none', savedRun: null,
   menuBackup: null,   // 从菜单“返回选人”时暂存的本局，选人页点“返回游戏”可恢复
+  opts: [],           // 当前卡的选项（engine.options()）
+  choice: false,      // 当前卡是抉择卡（有 L/R）；false = 叙事卡（只有“继续”）
+  choiceList: [],     // 抉择卡的选项按钮 [{ el, sel, dir }]，顺序 = 键盘高亮顺序
+  hl: -1,             // 键盘高亮的是 choiceList 里的第几个；-1 = 没有
+  lockUntil: 0,       // 这个时刻之前抉择卡不接受选择（performance.now()）
+  lockTimer: 0, nudgeTimer: 0, hintAt: 0,
 };
 const els = {};
 
@@ -246,8 +257,8 @@ function setBg(key) {
   els.bg.src = 'assets/img/' + key + '.webp';
 }
 
-function toast(text) {
-  const t = h('div', 'toast', text);
+function toast(text, cls) {
+  const t = h('div', 'toast' + (cls ? ' ' + cls : ''), text);
   els.toasts.appendChild(t);
   void t.offsetWidth; // 强制回流后再加 show，触发过渡
   t.classList.add('show');
@@ -485,6 +496,7 @@ function showCard(card) {
 
   // 预览缓存 + 选项区
   const opts = ui.engine.options();
+  ui.opts = opts;
   ui.previews = {};
   opts.forEach(function (o) { ui.previews[o.sel] = ui.engine.preview(o.sel); });
   buildOptions(opts);
@@ -498,32 +510,115 @@ function buildCaption(card) {
   return cap;
 }
 
+/**
+ * 选项区。
+ * 叙事卡（只有“继续”）：一个“左右滑动继续”的胶囊，滑动 / 点它 / 空格回车都能继续。
+ * 抉择卡（有 L/R）：顶上一个“抉择”标记，下面是整行的大按钮（完整文字，不带箭头，竖排），
+ *   有道具时多一个金色的“使用【道具】”按钮。只有点按钮（或键盘高亮后回车）才算选；
+ *   卡片出现后 LOCK_MS 毫秒内不接受选择。
+ */
 function buildOptions(opts) {
-  clear(els.optbar);
-  opts.filter(function (o) { return o.side === 'P'; }).forEach(function (o) {
-    els.optbar.appendChild(button('propbtn', '使用【' + o.prop + '】：' + o.label, function () { commit(o.sel, 0); }));
-  });
-  const pills = h('div', 'pills');
-  const n = opts.filter(function (o) { return o.side === 'N'; })[0];
-  if (n) {
-    pills.appendChild(button('pill continue', '左右滑动继续', function () { commit('N', 1); }));
-  } else {
-    const l = opts.filter(function (o) { return o.side === 'L'; })[0];
-    const r = opts.filter(function (o) { return o.side === 'R'; })[0];
-    if (l) pills.appendChild(button('pill', '← ' + l.label, function () { commit('L', -1); }));
-    if (r) pills.appendChild(button('pill', r.label + ' →', function () { commit('R', 1); }));
+  const bar = els.optbar;
+  clear(bar);
+  bar.classList.remove('is-choice', 'locked', 'nudge');
+  clearTimeout(ui.lockTimer);
+  clearTimeout(ui.nudgeTimer);
+  ui.choiceList = [];
+  ui.hl = -1;
+  ui.hintAt = 0;
+  ui.choice = opts.some(function (o) { return o.side === 'L' || o.side === 'R'; });
+  if (!ui.choice) {
+    bar.removeAttribute('role');
+    bar.removeAttribute('aria-label');
+    const pills = h('div', 'pills');
+    if (hasN()) pills.appendChild(button('pill continue', '左右滑动继续', function () { commit('N', 1); }));
+    bar.appendChild(pills);
+    return;
   }
-  els.optbar.appendChild(pills);
+
+  bar.classList.add('is-choice', 'locked');
+  bar.setAttribute('role', 'group');
+  bar.setAttribute('aria-label', '抉择');
+  bar.appendChild(h('div', 'choice-head', '抉择'));
+  opts.filter(function (o) { return o.side === 'P'; }).forEach(function (o) {
+    bar.appendChild(button('propbtn', '使用【' + o.prop + '】：' + o.label, function () { commit(o.sel, 0); }));
+  });
+  ['L', 'R'].forEach(function (side) {
+    const o = opts.filter(function (x) { return x.side === side; })[0];
+    if (!o) return;
+    const dir = side === 'L' ? -1 : 1;
+    const b = h('button', 'choice ' + side);
+    b.type = 'button';
+    fillText(b, o.label);
+    b.addEventListener('click', function () { commit(o.sel, dir); });
+    // 鼠标移上去 / 键盘高亮时，数值栏上亮点预览会影响哪些数值（和以前拖动时一样）
+    b.addEventListener('pointerenter', function (e) {
+      if (e.pointerType === 'mouse') showDots(ui.previews[o.sel] || null);
+    });
+    b.addEventListener('pointerleave', function () { showDots(hlPreview()); });
+    // 鼠标点按不抢焦点：焦点（也就是高亮）只由键盘产生，所以“点过一下被输入锁挡掉的按钮”之后回车不会直接选中它
+    b.addEventListener('mousedown', function (e) { e.preventDefault(); });
+    b.addEventListener('focus', function () {         // Tab 键移过来的焦点 = 高亮
+      const k = ui.choiceList.findIndex(function (c) { return c.el === b; });
+      if (k >= 0 && k !== ui.hl) setHl(k);
+    });
+    b.addEventListener('blur', function () {
+      const k = ui.choiceList.findIndex(function (c) { return c.el === b; });
+      if (k >= 0 && k === ui.hl) setHl(-1);
+    });
+    bar.appendChild(b);
+    ui.choiceList.push({ el: b, sel: o.sel, dir: dir });
+  });
+  ui.lockUntil = performance.now() + LOCK_MS;
+  ui.lockTimer = setTimeout(function () { bar.classList.remove('locked'); }, LOCK_MS + 40);
+}
+
+function hasN() {
+  return ui.opts.some(function (o) { return o.side === 'N'; });
+}
+
+function hlPreview() {
+  const c = ui.choiceList[ui.hl];
+  return c ? ui.previews[c.sel] || null : null;
+}
+
+/** 设置键盘高亮（-1 = 取消）。高亮的按钮同时拿到焦点，读屏和 Tab 顺序跟着走。 */
+function setHl(i) {
+  ui.hl = i;
+  ui.choiceList.forEach(function (c, k) { c.el.classList.toggle('hl', k === i); });
+  const c = ui.choiceList[i];
+  if (c) {
+    try { c.el.focus({ preventScroll: true }); } catch (err) { /* ignore */ }
+  }
+  showDots(hlPreview());
+}
+
+/** 抉择卡上滑动：不提交；弹一条提示并让选项按钮轻晃一下（提示显示期间不重复弹）。 */
+function swipeHint() {
+  const now = performance.now();
+  if (!ui.hintAt || now - ui.hintAt > 1900) {
+    ui.hintAt = now;
+    toast(CHOICE_HINT, 'hint');
+  }
+  const bar = els.optbar;
+  bar.classList.remove('nudge');
+  void bar.offsetWidth;   // 强制回流，连续滑动时动画能重播
+  bar.classList.add('nudge');
+  clearTimeout(ui.nudgeTimer);
+  ui.nudgeTimer = setTimeout(function () { bar.classList.remove('nudge'); }, 1000);
+}
+
+function dismissHint() {
+  const list = els.toasts.querySelectorAll('.toast.hint');
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].parentNode) list[i].parentNode.removeChild(list[i]);
+  }
+  ui.hintAt = 0;
 }
 
 // ---------- 拖拽 ----------
-function selForSide(side) {
-  const opts = ui.engine.options();
-  if (opts.length === 1 && opts[0].side === 'N') return 'N';
-  const o = opts.filter(function (x) { return x.side === side; })[0];
-  return o ? o.sel : null;
-}
-
+// 叙事卡：滑一下就继续（盖“继续”章，和以前一样）。
+// 抉择卡：滑动不提交——卡片只轻轻跟手（有上限、不盖章、不预览数值），松手弹回，并提示“点下面的选项”。
 function onDragStart() {
   if (ui.cardEl) {
     ui.cardEl.classList.remove('enter', 'back');
@@ -535,38 +630,44 @@ function onDragMove(dx) {
   const el = ui.cardEl;
   if (!el) return;
   const w = el.offsetWidth || 300;
+  if (ui.choice) {
+    const d = Math.max(-DRAG_CAP, Math.min(DRAG_CAP, dx * 0.3));
+    el.style.transform = 'translateX(' + d + 'px) rotate(' + ((d / w) * 24) + 'deg)';
+    return;
+  }
   const rot = Math.max(-12, Math.min(12, (dx / w) * 24));
   el.style.transform = 'translateX(' + dx + 'px) rotate(' + rot + 'deg)';
   const side = dx < 0 ? 'L' : 'R';
-  const sel = selForSide(side);
   const st = ui.stampEl;
-  if (!sel) { st.style.opacity = '0'; showDots(null); return; }
-  const o = ui.engine.options().filter(function (x) { return x.sel === sel; })[0];
+  const o = ui.opts.filter(function (x) { return x.side === 'N'; })[0];
+  if (!o) return;
   st.className = 'stamp ' + side;
-  st.textContent = o ? o.label : '';
+  st.textContent = o.label;
   st.style.opacity = String(Math.min(1, Math.abs(dx) / (w * 0.28)));
-  showDots(Math.abs(dx) > 10 ? ui.previews[sel] : null);
+  showDots(Math.abs(dx) > 10 ? ui.previews.N : null);
 }
 
 function onDragEnd(dx, side) {
   const el = ui.cardEl;
   if (!el) return;
-  const sel = side ? selForSide(side) : null;
-  if (sel) {
-    commit(sel, dx < 0 ? -1 : 1);
+  if (!ui.choice && side && hasN()) {
+    commit('N', dx < 0 ? -1 : 1);
     return;
   }
+  if (ui.choice && (side || Math.abs(dx) > HINT_DRAG_PX)) swipeHint();
   el.classList.remove('dragging');
   el.classList.add('back');
   el.style.transform = '';
   ui.stampEl.style.opacity = '0';
-  showDots(null);
+  showDots(hlPreview());
 }
 
 /** 提交选项：卡片飞出后再进入下一张。dir：-1 向左飞，1 向右，0 向上（道具）。 */
 function commit(sel, dir) {
   if (ui.busy || ui.modal || ui.screen !== 'game' || !ui.cardEl) return;
+  if (ui.choice && performance.now() < ui.lockUntil) return;   // 抉择卡刚出现：先挡一下，防连点和残余手势
   ui.busy = true;
+  dismissHint();
   const el = ui.cardEl;
   const w = els.stage.clientWidth;
   el.classList.remove('dragging', 'enter', 'back');
@@ -581,27 +682,44 @@ function commit(sel, dir) {
   }, FLY_MS);
 }
 
-function onKey(sel) {
+/**
+ * 键盘。key = 'left'|'right'|'up'|'down'|'prop'|'ok'。返回 true 表示按键已处理（会被 preventDefault）。
+ * 叙事卡：空格/回车/左右 = 继续，和以前一样。
+ * 抉择卡：方向键（含 A/D/↑/↓）只移动高亮，空格/回车确认高亮的那个；一开始没有高亮，
+ *   所以第一下只是把高亮放到第一个选项上；E/W 直接用道具（有的话）。
+ */
+function onKey(key, e) {
   if (ui.screen !== 'game') {
-    if (sel === 'N' && ui.kbN) ui.kbN();
-    return;
+    if (key === 'ok' && ui.kbN) { ui.kbN(); return true; }
+    return false;     // 没有要接管的：焦点在按钮上时，回车/空格照常触发按钮
   }
-  if (ui.busy || !ui.cardEl) return;
-  const opts = ui.engine.options();
-  if (!opts.length) return;
-  if (opts.length === 1 && opts[0].side === 'N') {
-    if (sel === 'N' || sel === 'L' || sel === 'R') commit('N', sel === 'L' ? -1 : 1);
-    return;
+  if (ui.busy || !ui.cardEl) return true;
+  if (!ui.opts.length) return true;
+
+  if (!ui.choice) {
+    if (hasN() && (key === 'ok' || key === 'left' || key === 'right')) commit('N', key === 'left' ? -1 : 1);
+    return key !== 'down';
   }
-  if (sel === 'P') {
-    const p = opts.filter(function (x) { return x.side === 'P'; })[0];
+
+  if (key === 'prop') {
+    const p = ui.opts.filter(function (x) { return x.side === 'P'; })[0];
     if (p) commit(p.sel, 0);
-    return;
+    return true;
   }
-  if (sel === 'L' || sel === 'R') {
-    const o = opts.filter(function (x) { return x.side === sel; })[0];
-    if (o) commit(o.sel, sel === 'L' ? -1 : 1);
+  const t = e && e.target;
+  if (key === 'ok' && t && t.closest && t.closest('.propbtn')) return false;   // 焦点在“使用道具”按钮上：它自己响应
+
+  const cur = ui.hl;   // 当前高亮的选项（Tab 过去的焦点也算高亮，见 buildOptions 里的 focus 监听）
+  const last = ui.choiceList.length - 1;
+  if (key === 'ok') {
+    if (cur < 0) setHl(0);                       // 还没高亮：只高亮第一个，不提交
+    else commit(ui.choiceList[cur].sel, ui.choiceList[cur].dir);
+    return true;
   }
+  if (cur < 0) setHl(0);
+  else if (key === 'left' || key === 'up') setHl(Math.max(0, cur - 1));
+  else setHl(Math.min(last, cur + 1));
+  return true;
 }
 
 // ---------- 开场动画 ----------

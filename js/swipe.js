@@ -69,20 +69,38 @@ export function attachDrag(area, h) {
   area.addEventListener('pointercancel', function (e) { finish(e, true); });
 }
 
-/** 键盘：A/← 左，D/→ 右，W/↑/E 用道具，空格/回车 继续。cb(sel) sel = 'L'|'R'|'P'|'N' */
+/**
+ * 键盘。只报“按了哪一类键”，含义由调用方按当前卡片决定：
+ *   'left'  A / ←        'right' D / →       'up' ↑      'down' ↓
+ *   'prop'  W / E        'ok'    空格 / 回车
+ * cb(key, event) 返回 true 表示它处理了这次按键（这里就 preventDefault）；
+ * 返回 false 则保持浏览器默认行为（比如焦点在某个按钮上时回车/空格触发它的点击）。
+ */
 export function attachKeys(cb, active) {
+  const handled = new Set();   // keydown 已处理的物理键：它的 keyup 也要吞掉，免得某些浏览器在 keyup 时给刚获得焦点的按钮补一个点击
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
     if (!active()) return;
-    let sel = null;
+    let key = null;
     switch (e.key) {
-      case 'a': case 'A': case 'ArrowLeft': sel = 'L'; break;
-      case 'd': case 'D': case 'ArrowRight': sel = 'R'; break;
-      case 'w': case 'W': case 'ArrowUp': case 'e': case 'E': sel = 'P'; break;
-      case ' ': case 'Enter': sel = 'N'; break;
+      case 'a': case 'A': case 'ArrowLeft': key = 'left'; break;
+      case 'd': case 'D': case 'ArrowRight': key = 'right'; break;
+      case 'ArrowUp': key = 'up'; break;
+      case 'ArrowDown': key = 'down'; break;
+      case 'w': case 'W': case 'e': case 'E': key = 'prop'; break;
+      case ' ': case 'Enter': key = 'ok'; break;
       default: return;
     }
-    e.preventDefault();
-    cb(sel);
+    if (cb(key, e)) {
+      e.preventDefault();
+      handled.add(e.code || e.key);
+    }
+  });
+  document.addEventListener('keyup', function (e) {
+    const k = e.code || e.key;
+    if (handled.has(k)) {
+      handled.delete(k);
+      e.preventDefault();
+    }
   });
 }

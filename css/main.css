@@ -367,6 +367,78 @@ button { font: inherit; color: inherit; cursor: pointer; }
   to { box-shadow: 0 0 16px rgba(245, 197, 66, 0.95); }
 }
 
+/* ---------- 抉择卡的选项区：整行大按钮，竖排，完整文字 ---------- */
+.optbar.is-choice { gap: 6px; padding-top: 6px; }
+.choice-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 14px;
+  flex: 0 0 auto;
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--gold);
+}
+.choice-head::before, .choice-head::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(245, 197, 66, 0), rgba(245, 197, 66, 0.6));
+}
+.choice-head::after { transform: scaleX(-1); }
+.choice {
+  display: block;
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 46px;
+  padding: 9px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  background: linear-gradient(rgba(255, 255, 255, 0.17), rgba(255, 255, 255, 0.08));
+  font-size: 15px;
+  line-height: 1.35;
+  font-weight: 600;
+  text-align: center;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  box-shadow: 0 3px 0 rgba(0, 0, 0, 0.28);
+  touch-action: manipulation;
+  transition: opacity 0.2s, background 0.12s, border-color 0.12s, transform 0.08s;
+}
+.choice:active { background: rgba(255, 255, 255, 0.3); transform: translateY(2px); box-shadow: 0 1px 0 rgba(0, 0, 0, 0.28); }
+@media (hover: hover) {
+  .choice:hover { background: rgba(255, 255, 255, 0.24); border-color: rgba(255, 255, 255, 0.7); }
+}
+/* 键盘高亮（含 Tab 到的焦点）：金色描边 + 微光，一眼能看出“选中但还没确认” */
+.choice.hl, .choice:focus-visible {
+  outline: none;
+  border-color: var(--gold);
+  background: rgba(245, 197, 66, 0.2);
+  box-shadow: 0 0 0 2px rgba(245, 197, 66, 0.65), 0 0 14px rgba(245, 197, 66, 0.45);
+}
+/* 刚出现的 500ms：按钮压暗，提示“还不能点” */
+.optbar.locked .choice, .optbar.locked .propbtn { opacity: 0.5; }
+.propbtn { transition: opacity 0.2s; }
+/* 在抉择卡上滑动：选项按钮轻晃一下并泛一圈金光 */
+.optbar.nudge .choice { animation: nudge 0.42s ease-in-out, cglow 0.9s ease-out; }
+@keyframes nudge {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-7px); }
+  40% { transform: translateX(7px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(4px); }
+}
+@keyframes cglow {
+  0% { box-shadow: 0 0 0 0 rgba(245, 197, 66, 0); }
+  30% { box-shadow: 0 0 0 3px rgba(245, 197, 66, 0.75), 0 0 18px rgba(245, 197, 66, 0.55); border-color: var(--gold); }
+  100% { box-shadow: 0 0 0 0 rgba(245, 197, 66, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .optbar.nudge .choice { animation: cglow 0.9s ease-out; }
+}
+
 .bottombar { flex: 0 0 auto; display: flex; gap: 8px; padding: 6px 14px 12px; }
 .slot {
   flex: 1;
@@ -659,6 +731,15 @@ button { font: inherit; color: inherit; cursor: pointer; }
   pointer-events: none;
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+/* “这是一道选择题”提示：放在卡片上方，别盖住下面的选项按钮 */
+.toast.hint {
+  bottom: auto;
+  top: calc(72px + env(safe-area-inset-top));
+  border: 1px solid var(--gold);
+  color: #ffe9a8;
+  transform: translate(-50%, -14px);
+}
+.toast.hint.show { transform: translate(-50%, 0); }
 
 /* ---------- 补充 ---------- */
 .cine-vig, .cine-cap { z-index: 2; }
