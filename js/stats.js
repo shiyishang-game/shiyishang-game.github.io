@@ -7,7 +7,7 @@
 
 export const ENDPOINT = 'https://cloud.umami.is/api/send';
 /** Umami 后台的 Website ID（公开值，写在网页里没关系，不是密钥）。为空 = 统计关闭。 */
-export const WEBSITE = '';
+export const WEBSITE = '414e32bb-2622-49ae-a3a1-7999fd6e182f';
 export const HOST = 'shiyishang-game.github.io';
 /** 每次打开页面最多发这么多条（免费额度 10 万条/月，防止刷屏的人把额度用光）。 */
 export const MAX_SENDS = 30;
