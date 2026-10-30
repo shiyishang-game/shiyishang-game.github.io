@@ -21,6 +21,9 @@ const LOCK_MS = 500;                           // 抉择卡出现后这段时间
 const DRAG_CAP = 28;                           // 抉择卡上拖拽时卡片最多跟手移动的像素
 const HINT_DRAG_PX = 24;                       // 抉择卡上拖过这么远松手才弹提示
 const CHOICE_HINT = '这是一道选择题——点下面的选项';
+const GUIDE_MARK = '✦ 通往';                    // 引路角标：「✦ 通往杰克爱」，挂在该选的那个选项上
+const GUIDE_TOAST_MS = 3200;                   // 引路 / 读档提示多停一会儿（比普通提示长，字多）
+const EPISODE_KEY = /^d\/e(\d+)/;              // 原剧截图的素材 key：d/e07_0425_7 -> 第 7 集
 let DEBUG = false;   // ?debug=1：占位图上显示素材 key（只给作者用）
 
 // ---------- 小工具 ----------
@@ -107,6 +110,13 @@ function imgBox(key, cls, opts) {
   img.src = 'assets/img/' + key + '.webp';
   if (img.complete && img.naturalWidth) fit();   // 命中缓存时同步拿到尺寸，避免版面跳一下
   return box;
+}
+
+/** 原剧截图（key 形如 d/e07_0425_7）左上角的小角标「原剧第7集」；别的图（结局图、AI 图、没图）返回 null。 */
+function episodeBadge(key) {
+  const m = EPISODE_KEY.exec(key || '');
+  const n = m ? parseInt(m[1], 10) : 0;
+  return n > 0 ? h('div', 'epbadge', '原剧第' + n + '集') : null;
 }
 
 // ---------- 全局状态 ----------
@@ -257,13 +267,14 @@ function setBg(key) {
   els.bg.src = 'assets/img/' + key + '.webp';
 }
 
-function toast(text, cls) {
+function toast(text, cls, ms) {
   const t = h('div', 'toast' + (cls ? ' ' + cls : ''), text);
   els.toasts.appendChild(t);
   void t.offsetWidth; // 强制回流后再加 show，触发过渡
   t.classList.add('show');
-  setTimeout(function () { t.classList.remove('show'); }, 1800);
-  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 2150);
+  const life = ms || 1800;
+  setTimeout(function () { t.classList.remove('show'); }, life);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, life + 350);
 }
 
 // ---------- 启动流程 ----------
@@ -468,7 +479,10 @@ function showCard(card) {
     fillText(wrap, card.say);
     el.appendChild(wrap);
   } else if (card.mode === 'full') {
-    el.appendChild(imgBox(card.img, 'card-full'));
+    const full = imgBox(card.img, 'card-full');
+    const epf = episodeBadge(card.img);
+    if (epf) full.appendChild(epf);
+    el.appendChild(full);
     el.appendChild(h('div', 'shade'));
     el.appendChild(buildCaption(card));
   } else {
@@ -482,6 +496,8 @@ function showCard(card) {
     }
     el.appendChild(h('div'));
     const frame = imgBox(card.img, 'frame', { aspect: FRAME_ASPECT });
+    const epw = episodeBadge(card.img);
+    if (epw) frame.appendChild(epw);                              // 集号角标贴在原帧的左上角
     if (card.tag) frame.appendChild(h('div', 'tag', card.tag));   // 名牌贴在原帧的左下角
     el.appendChild(frame);
     el.appendChild(buildCaption(card));
@@ -541,7 +557,8 @@ function buildOptions(opts) {
   bar.setAttribute('aria-label', '抉择');
   bar.appendChild(h('div', 'choice-head', '抉择'));
   opts.filter(function (o) { return o.side === 'P'; }).forEach(function (o) {
-    bar.appendChild(button('propbtn', '使用【' + o.prop + '】：' + o.label, function () { commit(o.sel, 0); }));
+    const pb = button('propbtn', '使用【' + o.prop + '】：' + o.label, function () { commit(o.sel, 0); });
+    bar.appendChild(guideMark(pb, o, 'prop'));
   });
   ['L', 'R'].forEach(function (side) {
     const o = opts.filter(function (x) { return x.side === side; })[0];
@@ -566,11 +583,27 @@ function buildOptions(opts) {
       const k = ui.choiceList.findIndex(function (c) { return c.el === b; });
       if (k >= 0 && k === ui.hl) setHl(-1);
     });
-    bar.appendChild(b);
+    bar.appendChild(guideMark(b, o));
     ui.choiceList.push({ el: b, sel: o.sel, dir: dir });
   });
   ui.lockUntil = performance.now() + LOCK_MS;
   ui.lockTimer = setTimeout(function () { bar.classList.remove('locked'); }, LOCK_MS + 40);
+}
+
+/**
+ * 引路：选项 o 带 guide（= 想遇见的人）时，在按钮右上角挂一个金色小角标「✦ 通往X」。
+ * 角标是按钮外面的兄弟节点（包一层 .gwrap），按钮自己的文字一个字都不动；没有引路时原样返回按钮。
+ */
+function guideMark(btn, o, kind) {
+  if (!o.guide) return btn;
+  const wrap = h('div', 'gwrap' + (kind ? ' ' + kind : ''));
+  btn.setAttribute('data-guide', o.guide);
+  wrap.appendChild(btn);
+  const badge = h('span', 'gbadge', GUIDE_MARK + o.guide);
+  badge.addEventListener('click', function () { btn.click(); });      // 点角标等于点它挂着的那个选项
+  badge.addEventListener('mousedown', function (e) { e.preventDefault(); });
+  wrap.appendChild(badge);
+  return wrap;
 }
 
 function hasN() {
@@ -597,6 +630,7 @@ function setHl(i) {
 function swipeHint() {
   const now = performance.now();
   if (!ui.hintAt || now - ui.hintAt > 1900) {
+    dismissHint();          // 引路 / 读档的提示还停在那儿的话，让位给这一条，免得两条叠在一起
     ui.hintAt = now;
     toast(CHOICE_HINT, 'hint');
   }
@@ -955,11 +989,7 @@ function showEnd(info, card) {
     const m = missed[0];
     const row = h('div', 'missed');
     row.appendChild(h('span', '', '你错过了一次相遇：' + m.meet));
-    row.appendChild(button('btn', '从那里重来', function () {
-      const res = ui.engine.restore(m.histIndex);
-      enterGame();
-      render(res);
-    }));
+    row.appendChild(button('btn', '从那里重来', function () { rewindGuided(m); }));
     root.appendChild(row);
   }
   const btns = h('div', 'ebtns');
@@ -968,7 +998,44 @@ function showEnd(info, card) {
   if (info.line !== 'common' || info.kind === 'hidden') btns.appendChild(button('btn', '换个世一上', goHub));
   btns.appendChild(button('btn', '结局图鉴', openGallery));
   btns.appendChild(button('btn', info.line === 'common' ? '重新开始' : '重开本线', restartLine));
+  // 读档：回到本局之前的任何一个抉择点重新选。菜是原罪（common）不需要；没有抉择点也不显示
+  if (info.line !== 'common' && ui.engine.decisionPoints().length) btns.appendChild(button('btn', '读档', openRewind));
   root.appendChild(btns);
+}
+
+/** 「从那里重来」：回到错过相遇的那个存档点，带上引路——一路上该选的选项会亮 ✦ 角标，直到遇见为止。 */
+function rewindGuided(m) {
+  const res = ui.engine.restore(m.histIndex, { meet: m.meet, path: m.path });
+  enterGame();
+  render(res);
+  toast('想遇见' + m.meet + '：这次试试「' + m.path[0].label + '」，跟着 ✦ 走', 'hint', GUIDE_TOAST_MS);
+}
+
+/** 读档面板：最近几个抉择点（推荐的那个标「推荐 · 还有活路」），点一行回到那一步。搜索只在点开时才做。 */
+function openRewind() {
+  const rp = ui.engine.rewindPoints();
+  const sheet = h('div', 'sheet rewind');
+  sheet.appendChild(h('h3', '', '回到之前的抉择'));
+  rp.points.forEach(function (p) {
+    const row = h('button', 'rrow' + (p.histIndex === rp.recommend ? ' best' : ''));
+    row.type = 'button';
+    if (p.histIndex === rp.recommend) row.appendChild(h('span', 'rbadge', '推荐 · 还有活路'));
+    const cut = p.more ? '…' : '';                       // 引擎截过（卡面不止 16 字）才加省略号
+    row.appendChild(h('span', 'rline', '第 ' + p.step + ' 步' + (p.text ? ' · ' + p.text + cut : '')));
+    row.appendChild(h('span', 'rpick', '你选了「' + p.label + '」'));
+    row.addEventListener('click', function () { rewindTo(p); });
+    sheet.appendChild(row);
+  });
+  sheet.appendChild(button('btn close', '关闭', closeModal));
+  openModal(sheet);
+}
+
+/** 读档：回到 hist 里的那个抉择点（不带引路），回到游戏屏。 */
+function rewindTo(p) {
+  const res = ui.engine.restore(p.histIndex);
+  enterGame();
+  render(res);
+  toast('已读档：上次你在这里选了「' + p.label + '」', 'hint', GUIDE_TOAST_MS);
 }
 
 function restartLine() {

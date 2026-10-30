@@ -1,9 +1,11 @@
 // 纯逻辑引擎：不碰 DOM、不碰 localStorage，可在 node 下单测。
 // 状态结构见 ENGINE_SPEC 第 4 节。
 
-const MAX_HIST = 80;
+const MAX_HIST = 300;
 const MAX_PROPS = 3;
 const MAX_HOPS = 20;
+/** _search 默认预算：最多展开多少个沙盒状态；超了按“找不到”处理（保守，不会推荐走不通的路）。 */
+export const SEARCH_BUDGET = 6000;
 const END_KIND_ORDER = ['death', 'prologue', 'if', 'hidden'];
 /** “换个世一上”“返回选人”的统一入口：条件卡，四线通关后会把人引向隐藏结局，否则落到选人页。 */
 export const HUB_CARD = 'common.hchk';
@@ -28,6 +30,151 @@ function clone(o) {
   return JSON.parse(JSON.stringify(o));
 }
 
+// ---------------------------------------------------------------------------
+// 共用核心：条件 / 效果 / 死亡 / 进卡 / 选项。
+// 全部作用于“传入的状态对象 s + 全局旗标对象 globals + 事件数组 events”，
+// 真实引擎传 this.s / gallery.globals / this.events，沙盒搜索（Engine._search）传自己的副本和 null，
+// 两边跑的是同一份代码，语义不会分叉。events 为 null 时不记事件。
+// ---------------------------------------------------------------------------
+function checkCond(conds, s, globals) {
+  if (!conds || !conds.length) return true;
+  for (const k of conds) {
+    let ok;
+    if (k.t === 'p') ok = s.props.indexOf(k.n) >= 0;
+    else if (k.t === 'f') ok = !!s.flags[k.n];
+    else if (k.t === 'g') ok = !!globals[k.n];
+    else if (k.t === 'm') ok = s.m[k.n] !== undefined && cmp(s.m[k.n], k.o, k.v);
+    else ok = false;
+    if (k.neg) ok = !ok;
+    if (!ok) return false;
+  }
+  return true;
+}
+
+function applyFxCore(list, s, globals, events) {
+  if (!list) return;
+  for (const e of list) {
+    if (e.t === 'm') {
+      const cur = s.m[e.n];
+      if (cur === undefined) continue;
+      s.m[e.n] = clamp(e.o === '+' ? cur + e.v : e.o === '-' ? cur - e.v : e.v);
+    } else if (e.t === 'p') {
+      const i = s.props.indexOf(e.n);
+      if (e.o === '+') {
+        if (i >= 0) continue;
+        s.props.push(e.n);
+        if (s.props.length > MAX_PROPS) {
+          const dropped = s.props.shift();
+          if (events) events.push({ type: 'toast', text: '道具栏已满，【' + dropped + '】被顶掉了' });
+        }
+      } else if (i >= 0) {
+        s.props.splice(i, 1);
+      }
+    } else if (e.t === 'f') {
+      if (e.o === '+') s.flags[e.n] = true; else delete s.flags[e.n];
+    } else if (e.t === 'g') {
+      if (e.o === '+') globals[e.n] = true; else delete globals[e.n];
+      if (events) events.push({ type: 'gallery' });
+    }
+  }
+}
+
+function deathOf(ln, s) {
+  if (!ln || !ln.deaths) return null;
+  for (const d of ln.deaths) {
+    const v = s.m[d.meter];
+    if (v !== undefined && cmp(v, d.op, d.val)) return d.end;
+  }
+  return null;
+}
+
+/**
+ * 进卡：if/else 链 -> 记 s.card -> 进卡 fx -> meet / seen -> 非结局卡再判死亡（死了就改道进结局卡）。
+ * 返回最终进入的那张卡对象；结局登记（_reachEnd）不在这里，由真实引擎在外面做。
+ */
+function enterCore(cards, ln, s, globals, events, cardId, redirects) {
+  let id = cardId;
+  let hops = 0;
+  let c;
+  for (;;) {
+    c = cards[id];
+    if (!c) throw new Error('missing card ' + id);
+    if (c.if && c.if.length && !checkCond(c.if, s, globals)) {
+      if (++hops > MAX_HOPS) throw new Error('if/else chain longer than ' + MAX_HOPS + ' at ' + cardId);
+      if (!c.else) throw new Error('if card without else: ' + id);
+      id = c.else;
+      continue;
+    }
+    break;
+  }
+  s.card = id;
+  applyFxCore(c.fx, s, globals, events);
+  if (c.meet && s.meets.indexOf(c.meet) < 0) s.meets.push(c.meet);
+  if (s.seen.indexOf(id) < 0) s.seen.push(id);
+  if (!c.end) {
+    const dead = deathOf(ln, s);
+    if (dead) {
+      const n = (redirects || 0) + 1;
+      if (n > MAX_HOPS) throw new Error('death redirect loop at ' + id);
+      return enterCore(cards, ln, s, globals, events, dead, n);
+    }
+  }
+  return c;
+}
+
+/** 选中一个选项之后发生的事：选项 fx -> 死亡检查 -> 进卡。返回最终进入的那张卡。 */
+function stepCore(cards, ln, s, globals, events, opt) {
+  applyFxCore(opt.fx, s, globals, events);
+  const dead = deathOf(ln, s);
+  return enterCore(cards, ln, s, globals, events, dead || opt.to);
+}
+
+function optOf(c, sel, props) {
+  if (sel === 'N') return c.next ? { t: '继续', fx: [], to: c.next } : null;
+  if (sel === 'L' || sel === 'R') return c[sel] || null;
+  if (typeof sel === 'string' && sel.indexOf('P:') === 0) {
+    const name = sel.slice(2);
+    if (props.indexOf(name) < 0) return null;
+    const list = c.P || [];
+    for (const p of list) if (p.p === name) return p;
+  }
+  return null;
+}
+
+function optionsOf(c, props) {
+  const out = [];
+  if (c.L || c.R) {
+    if (c.L) out.push({ side: 'L', sel: 'L', label: c.L.t });
+    if (c.R) out.push({ side: 'R', sel: 'R', label: c.R.t });
+    for (const p of (c.P || [])) {
+      if (props.indexOf(p.p) >= 0) {
+        out.push({ side: 'P', sel: 'P:' + p.p, label: p.t, prop: p.p });
+      }
+    }
+  } else if (c.next) {
+    out.push({ side: 'N', sel: 'N', label: '继续' });
+  }
+  return out;
+}
+
+/** 某张卡上某个选择的显示文字。 */
+function labelOf(c, sel) {
+  if (!c || !sel) return '';
+  if (sel === 'N') return '继续';
+  if (sel === 'L' || sel === 'R') return c[sel] ? c[sel].t : '';
+  if (sel.indexOf('P:') === 0) {
+    const name = sel.slice(2);
+    for (const p of (c.P || [])) if (p.p === name) return p.t;
+  }
+  return '';
+}
+
+/** excludeSel 排除谁：精确匹配；旧存档只有 side 'P' 时（不知道用的哪个道具）排除所有 P:*。 */
+function isExcluded(sel, ex) {
+  if (!ex) return false;
+  return sel === ex || (ex === 'P' && sel.indexOf('P:') === 0);
+}
+
 export function majorOf(version) {
   const n = parseInt(String(version || '0').split('.')[0], 10);
   return isNaN(n) ? 0 : n;
@@ -49,6 +196,13 @@ export class Engine {
     this.s = null;
     this.events = [];
     this._meetCache = {};
+    /** 引路：{meet, path:[{card,sel,label}], i}。只在内存里，不进存档。 */
+    this.guide = null;
+    /** 沙盒搜索的累计统计（测试 / 性能报告用）：调用次数、展开状态数、超预算次数。 */
+    this._stat = { searches: 0, expanded: 0, truncated: 0 };
+    this._reach = {};
+    this._rev = null;
+    this._rel = null;
   }
 
   // ---- 基本访问 ----
@@ -80,6 +234,7 @@ export class Engine {
       v: this.story.version, line: id, card: null, m,
       props: [], flags: {}, keys: [], meets: [], hist: [], seen: [],
     };
+    this.guide = null;
     return ln;
   }
 
@@ -104,6 +259,7 @@ export class Engine {
 
   /** 读档。返回 'ok' | 'none' | 'outdated'。outdated 时本局状态未载入。 */
   loadRun(run) {
+    this.guide = null;
     if (!run || typeof run !== 'object' || !run.line) return 'none';
     if (majorOf(run.v) !== majorOf(this.story.version)) return 'outdated';
     if (!this.story.lines[run.line] || !this.card(run.card)) return 'outdated';
@@ -134,87 +290,23 @@ export class Engine {
     return c ? this._result(c) : null;
   }
 
-  // ---- 条件与效果 ----
+  // ---- 条件与效果（核心在文件顶部的共用函数里，这里只是绑定真实状态的外壳）----
   check(conds) {
-    if (!conds || !conds.length) return true;
-    const s = this.s;
-    for (const k of conds) {
-      let ok;
-      if (k.t === 'p') ok = s.props.indexOf(k.n) >= 0;
-      else if (k.t === 'f') ok = !!s.flags[k.n];
-      else if (k.t === 'g') ok = !!this.gallery.globals[k.n];
-      else if (k.t === 'm') ok = s.m[k.n] !== undefined && cmp(s.m[k.n], k.o, k.v);
-      else ok = false;
-      if (k.neg) ok = !ok;
-      if (!ok) return false;
-    }
-    return true;
+    return checkCond(conds, this.s, this.gallery.globals);
   }
 
   applyFx(list) {
-    if (!list) return;
-    const s = this.s;
-    for (const e of list) {
-      if (e.t === 'm') {
-        const cur = s.m[e.n];
-        if (cur === undefined) continue;
-        s.m[e.n] = clamp(e.o === '+' ? cur + e.v : e.o === '-' ? cur - e.v : e.v);
-      } else if (e.t === 'p') {
-        const i = s.props.indexOf(e.n);
-        if (e.o === '+') {
-          if (i >= 0) continue;
-          s.props.push(e.n);
-          if (s.props.length > MAX_PROPS) {
-            const dropped = s.props.shift();
-            this.events.push({ type: 'toast', text: '道具栏已满，【' + dropped + '】被顶掉了' });
-          }
-        } else if (i >= 0) {
-          s.props.splice(i, 1);
-        }
-      } else if (e.t === 'f') {
-        if (e.o === '+') s.flags[e.n] = true; else delete s.flags[e.n];
-      } else if (e.t === 'g') {
-        if (e.o === '+') this.gallery.globals[e.n] = true; else delete this.gallery.globals[e.n];
-        this.events.push({ type: 'gallery' });
-      }
-    }
+    applyFxCore(list, this.s, this.gallery.globals, this.events);
   }
 
   checkDeath() {
-    const ln = this.line();
-    if (!ln || !ln.deaths) return null;
-    for (const d of ln.deaths) {
-      const v = this.s.m[d.meter];
-      if (v !== undefined && cmp(v, d.op, d.val)) return d.end;
-    }
-    return null;
+    return deathOf(this.line(), this.s);
   }
 
   // ---- 进卡 ----
   enter(cardId) {
     const s = this.s;
-    let id = cardId;
-    let hops = 0;
-    let c;
-    for (;;) {
-      c = this.card(id);
-      if (!c) throw new Error('missing card ' + id);
-      if (c.if && c.if.length && !this.check(c.if)) {
-        if (++hops > MAX_HOPS) throw new Error('if/else chain longer than ' + MAX_HOPS + ' at ' + cardId);
-        if (!c.else) throw new Error('if card without else: ' + id);
-        id = c.else;
-        continue;
-      }
-      break;
-    }
-    s.card = id;
-    this.applyFx(c.fx);
-    if (c.meet && s.meets.indexOf(c.meet) < 0) s.meets.push(c.meet);
-    if (s.seen.indexOf(id) < 0) s.seen.push(id);
-    if (!c.end) {
-      const dead = this.checkDeath();
-      if (dead) return this.enter(dead);
-    }
+    const c = enterCore(this.story.cards, this.story.lines[s.line], s, this.gallery.globals, this.events, cardId);
     return this._result(c);
   }
 
@@ -252,31 +344,19 @@ export class Engine {
   options() {
     const c = this.cur;
     if (!c || c.end || c.screen) return [];
-    const out = [];
-    if (c.L || c.R) {
-      if (c.L) out.push({ side: 'L', sel: 'L', label: c.L.t });
-      if (c.R) out.push({ side: 'R', sel: 'R', label: c.R.t });
-      for (const p of (c.P || [])) {
-        if (this.s.props.indexOf(p.p) >= 0) {
-          out.push({ side: 'P', sel: 'P:' + p.p, label: p.t, prop: p.p });
-        }
+    const out = optionsOf(c, this.s.props);
+    const g = this.guide;
+    if (g) {
+      const st = g.path[g.i];
+      if (st && st.card === c.id) {
+        for (const o of out) if (o.sel === st.sel) o.guide = g.meet;
       }
-    } else if (c.next) {
-      out.push({ side: 'N', sel: 'N', label: '继续' });
     }
     return out;
   }
 
   _opt(c, sel) {
-    if (sel === 'N') return c.next ? { t: '继续', fx: [], to: c.next } : null;
-    if (sel === 'L' || sel === 'R') return c[sel] || null;
-    if (typeof sel === 'string' && sel.indexOf('P:') === 0) {
-      const name = sel.slice(2);
-      if (this.s.props.indexOf(name) < 0) return null;
-      const list = c.P || [];
-      for (const p of list) if (p.p === name) return p;
-    }
-    return null;
+    return optOf(c, sel, this.s.props);
   }
 
   /** 该选项会改变的数值：{数值名: delta}（不含 0）。 */
@@ -313,62 +393,284 @@ export class Engine {
     const opt = this._opt(c, sel);
     if (!opt) throw new Error('no such option ' + sel + ' on ' + c.id);
     const s = this.s;
-    s.hist.push({ card: c.id, side: sel.charAt(0), snap: this._snap() });
+    s.hist.push({ card: c.id, side: sel.charAt(0), sel, snap: this._snap() });
     if (s.hist.length > MAX_HIST) s.hist.shift();
     if (c.key && sel !== 'N') {
       const i = s.keys.findIndex((k) => k.key === c.key);
       const rec = { key: c.key, label: opt.t };
       if (i >= 0) s.keys[i] = rec; else s.keys.push(rec);
     }
-    this.applyFx(opt.fx);
-    const dead = this.checkDeath();
-    return this.enter(dead || opt.to);
+    const fin = stepCore(this.story.cards, this.story.lines[s.line], s, this.gallery.globals, this.events, opt);
+    const res = this._result(fin);
+    this._advanceGuide(c.id, sel, res);
+    return res;
   }
 
-  // ---- 错过的相遇 ----
-  _graphNext(c) {
-    const out = [];
-    if (c.else) out.push(c.else);
-    if (c.L) out.push(c.L.to);
-    if (c.R) out.push(c.R.to);
-    for (const p of (c.P || [])) out.push(p.to);
-    if (c.next) out.push(c.next);
-    return out;
+  /** 玩家按引路选了 -> 前进一步；选了别的 / 见到了目标 / 进了结局 / 走完 -> 清掉引路。 */
+  _advanceGuide(cardId, sel, res) {
+    const g = this.guide;
+    if (!g) return;
+    const st = g.path[g.i];
+    if (!st || st.card !== cardId || st.sel !== sel || res.kind === 'end' || this.s.meets.indexOf(g.meet) >= 0) {
+      this.guide = null;
+      return;
+    }
+    g.i++;
+    const nx = g.path[g.i];
+    if (!nx || nx.card !== this.s.card) this.guide = null;
   }
 
-  _canReachMeet(from, meet) {
+  // ---- 沙盒搜索：错过的相遇 / 读档推荐 ----
+  /**
+   * 从 hist 某点的快照出发，在“沙盒”里按真实 choose 的语义（选项 fx -> 死亡检查 -> if/else -> 进卡 fx -> 死亡检查）
+   * 最佳优先（静态图上离目标最近的先展开）找一条通往 goal 的选择序列：长线上目标在一百多步之外也能很快找到；
+   * 找不到时同样会穷尽整张可达图，所以“没超预算 + 没找到”仍然等于“确实走不到”。沙盒是状态的副本：不碰 this.s / this.gallery / this.events，不登记结局。
+   *   goal = {meet:'杰克爱'}：最终停在一张带该 meet 的普通卡上即成功（进卡就被 fx 弄死的不算，玩家根本看不到那张卡）；
+   *   goal = {alive:true}：进入非 death 类结局卡即成功；
+   *   其它结局卡 / screen 卡 = 这一支失败。
+   * excludeSel：第一步排除的选择（当时实际选的那个；旧存档的 'P' 表示排除所有道具选项）。
+   * budget：最多展开多少个状态（默认 SEARCH_BUDGET），超了按“找不到”处理（保守）。
+   * memo：可选 Map，一次 missed()/rewindPoints() 内共享“已证明走不通”的状态，避免重复搜索。
+   * 返回 null 或 [{card, sel, label}]（从该卡的第一步开始，到目标那一步为止）。
+   */
+  _search(snap, cardId, excludeSel, goal, budget, memo) {
+    const stat = this._stat;
+    stat.searches++;
+    this._last = { expanded: 0, truncated: false, found: false };
+    const root = this.card(cardId);
+    if (!root || root.end || root.screen || !snap) return null;
+    const ln = this.story.lines[(this.s && this.s.line) || root.ln];      // 死亡规则按“本局的线”判，和真实 enter 一致
+    if (!ln) return null;
     const cards = this.story.cards;
-    const seen = new Set([from]);
-    const q = [from];
-    while (q.length) {
-      const id = q.shift();
-      const c = cards[id];
-      if (!c) continue;
-      if (c.meet === meet) return true;
-      if (c.end) continue;
-      for (const t of this._graphNext(c)) {
-        if (t && !seen.has(t)) { seen.add(t); q.push(t); }
+    const limit = budget === undefined || budget === null ? SEARCH_BUDGET : budget;
+    const rel = this._relevance();
+    const reach = this._reachSet(goal);
+    const dist = this._distTo(goal);
+    const meters = (ln.meters || []).filter((n) => rel.meters.has(n));
+    const fl = rel.flags;
+    const gl = rel.globals;
+    const wantMeet = goal.meet;
+    const goalKey = wantMeet ? 'm:' + wantMeet : 'alive';
+    let dead = null;
+    if (memo) {
+      dead = memo.get(goalKey);
+      if (!dead) { dead = new Set(); memo.set(goalKey, dead); }
+    }
+    // 去重键：卡 + 影响行为的数值 + 道具（保持顺序：满 3 个会顶掉最早的）+ 被条件读到的 flags / 全局旗标
+    const keyOf = (st, g) => {
+      let k = st.card + '|';
+      for (let i = 0; i < meters.length; i++) k += st.m[meters[i]] + ',';
+      k += '|' + st.props.join(',') + '|';
+      for (let i = 0; i < fl.length; i++) k += st.flags[fl[i]] ? '1' : '0';
+      k += '|';
+      for (let i = 0; i < gl.length; i++) k += g[gl[i]] ? '1' : '0';
+      return k;
+    };
+    const rootS = {
+      card: cardId, m: Object.assign({}, snap.m), props: (snap.props || []).slice(),
+      flags: Object.assign({}, snap.flags || {}), meets: [], seen: [],
+    };
+    const rootG = Object.assign({}, this.gallery.globals);
+    const visited = new Set();
+    // 小顶堆：先比静态距离，再比入堆顺序（同距离时先进先出，保持确定性）
+    const heap = [];
+    let seq = 0;
+    const less = (a, b) => a.pri < b.pri || (a.pri === b.pri && a.seq < b.seq);
+    const push = (n) => {
+      heap.push(n);
+      let i = heap.length - 1;
+      while (i > 0) {
+        const pi = (i - 1) >> 1;
+        if (!less(heap[i], heap[pi])) break;
+        const t = heap[i]; heap[i] = heap[pi]; heap[pi] = t; i = pi;
+      }
+    };
+    const pop = () => {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length) {
+        heap[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1, r = l + 1;
+          let m = i;
+          if (l < heap.length && less(heap[l], heap[m])) m = l;
+          if (r < heap.length && less(heap[r], heap[m])) m = r;
+          if (m === i) break;
+          const t = heap[i]; heap[i] = heap[m]; heap[m] = t; i = m;
+        }
+      }
+      return top;
+    };
+    push({ s: rootS, g: rootG, parent: null, step: null, pri: 0, seq: seq++ });
+    let expanded = 0;
+    let truncated = false;
+    let hit = null;
+    while (heap.length && !hit) {
+      if (expanded >= limit) { truncated = true; break; }
+      expanded++;
+      const node = pop();
+      const c = cards[node.s.card];
+      const isRoot = node.parent === null;
+      const opts = optionsOf(c, node.s.props);
+      for (let oi = 0; oi < opts.length; oi++) {
+        const o = opts[oi];
+        if (isRoot && isExcluded(o.sel, excludeSel)) continue;
+        const opt = optOf(c, o.sel, node.s.props);
+        if (!opt) continue;
+        const ps = node.s;
+        const cs = { card: ps.card, m: Object.assign({}, ps.m), props: ps.props.slice(), flags: Object.assign({}, ps.flags), meets: [], seen: [] };
+        const cg = Object.assign({}, node.g);
+        let fin;
+        try {
+          fin = stepCore(cards, ln, cs, cg, null, opt);
+        } catch (e) {
+          continue;                     // 剧本在这条分支上会抛错：当作走不通（真实游戏里同样走不下去）
+        }
+        const step = { card: c.id, sel: o.sel, label: opt.t };
+        if (fin.end) {
+          if (!wantMeet && fin.end.kind !== 'death') { hit = { parent: node, step }; break; }
+          continue;
+        }
+        if (fin.screen) continue;
+        if (wantMeet && fin.meet === wantMeet) { hit = { parent: node, step }; break; }
+        if (!reach.has(fin.id)) continue;           // 静态图上都到不了目标：剪掉
+        const key = keyOf(cs, cg);
+        if (visited.has(key) || (dead && dead.has(key))) continue;
+        visited.add(key);
+        push({ s: cs, g: cg, parent: node, step, pri: dist[fin.id], seq: seq++ });
       }
     }
-    return false;
+    stat.expanded += expanded;
+    this._last = { expanded, truncated, found: !!hit };
+    if (hit) {
+      const path = [hit.step];
+      for (let n = hit.parent; n && n.step; n = n.parent) path.push(n.step);
+      return path.reverse();
+    }
+    if (truncated) {
+      stat.truncated++;
+    } else if (dead) {
+      for (const k of visited) dead.add(k);         // 整张可达图都穷尽了还没有目标：里面每个状态都走不通
+    }
+    return null;
   }
 
+  /** 静态图（忽略一切条件）上各卡的“反向邻居”：else / L / R / P / next，以及非结局卡 -> 本线死亡规则的结局。 */
+  _staticRev() {
+    if (this._rev) return this._rev;
+    const rev = {};
+    const add = (from, to) => { if (to) (rev[to] = rev[to] || []).push(from); };
+    const cards = this.story.cards;
+    for (const id in cards) {
+      const c = cards[id];
+      add(id, c.else);
+      if (c.L) add(id, c.L.to);
+      if (c.R) add(id, c.R.to);
+      for (const p of (c.P || [])) add(id, p.to);
+      add(id, c.next);
+      if (!c.end) {
+        const ln = this.story.lines[c.ln];
+        for (const d of ((ln && ln.deaths) || [])) add(id, d.end);
+      }
+    }
+    this._rev = rev;
+    return rev;
+  }
+
+  /** 静态图上能走到目标的卡集合：只用来剪枝（它是真实可达的超集，剪掉的一定走不到）。 */
+  _reachSet(goal) {
+    const gk = goal.meet ? 'm:' + goal.meet : 'alive';
+    if (this._reach[gk]) return this._reach[gk];
+    const cards = this.story.cards;
+    const rev = this._staticRev();
+    const set = new Set();
+    const q = [];
+    for (const id in cards) {
+      const c = cards[id];
+      const isGoal = goal.meet ? (!c.end && !c.screen && c.meet === goal.meet) : !!(c.end && c.end.kind !== 'death');
+      if (isGoal) { set.add(id); q.push(id); }
+    }
+    while (q.length) {
+      const x = q.pop();
+      for (const p of (rev[x] || [])) if (!set.has(p)) { set.add(p); q.push(p); }
+    }
+    this._reach[gk] = set;
+    return set;
+  }
+
+  /** 静态图上各卡到目标的最少步数（_reachSet 的带距离版），给最佳优先搜索排序用。 */
+  _distTo(goal) {
+    const gk = 'd:' + (goal.meet ? 'm:' + goal.meet : 'alive');
+    if (this._reach[gk]) return this._reach[gk];
+    const cards = this.story.cards;
+    const rev = this._staticRev();
+    const dist = {};
+    const q = [];
+    for (const id in cards) {
+      const c = cards[id];
+      const isGoal = goal.meet ? (!c.end && !c.screen && c.meet === goal.meet) : !!(c.end && c.end.kind !== 'death');
+      if (isGoal) { dist[id] = 0; q.push(id); }
+    }
+    for (let h = 0; h < q.length; h++) {
+      const x = q[h];
+      for (const p of (rev[x] || [])) if (dist[p] === undefined) { dist[p] = dist[x] + 1; q.push(p); }
+    }
+    this._reach[gk] = dist;
+    return dist;
+  }
+
+  /** 会影响行为的名字：被 if 条件读到的 flags / 全局旗标 / 数值，加上死亡规则读的数值。没人读的不进去重键（合并等价状态）。 */
+  _relevance() {
+    if (this._rel) return this._rel;
+    const flags = new Set();
+    const globals = new Set();
+    const meters = new Set();
+    for (const id in this.story.cards) {
+      for (const k of (this.story.cards[id].if || [])) {
+        if (k.t === 'f') flags.add(k.n);
+        else if (k.t === 'g') globals.add(k.n);
+        else if (k.t === 'm') meters.add(k.n);
+      }
+    }
+    for (const lid in this.story.lines) {
+      for (const d of (this.story.lines[lid].deaths || [])) meters.add(d.meter);
+    }
+    this._rel = { flags: Array.from(flags).sort(), globals: Array.from(globals).sort(), meters };
+    return this._rel;
+  }
+
+  /** hist 记录的完整选择。旧存档没有 sel：L/R/N 直接用 side；side 为 P 时按快照里的道具推断，推断不出就返回 'P'（= 所有道具选项）。 */
+  _selOf(h, i) {
+    if (h.sel) return h.sel;
+    if (h.side !== 'P') return h.side;
+    const c = this.card(h.card);
+    const props = (h.snap && h.snap.props) || [];
+    const cand = ((c && c.P) || []).filter((p) => props.indexOf(p.p) >= 0);
+    if (cand.length === 1) return 'P:' + cand[0].p;
+    const hist = this.s.hist;
+    const after = i + 1 < hist.length ? hist[i + 1].snap.props : this.s.props;
+    const used = cand.filter((p) => after.indexOf(p.p) < 0);
+    return used.length === 1 ? 'P:' + used[0].p : 'P';
+  }
+
+  /**
+   * 错过的相遇：本线每个还没遇见的 meet，从最近的 hist 点往前扫，取第一个（最晚的）在沙盒里真正走得到的点，
+   * 返回 {meet, histIndex, cardId, path}，最多 3 个。path 是从该点换个选项一路走到那张 meet 卡的选择序列。
+   */
   missed() {
     const s = this.s;
     const out = [];
+    if (!s) return out;
+    const memo = new Map();
     for (const meet of this.lineMeets(s.line)) {
       if (s.meets.indexOf(meet) >= 0) continue;
       for (let i = s.hist.length - 1; i >= 0; i--) {
         const h = s.hist[i];
-        const c = this.card(h.card);
-        if (!c) continue;
-        let found = false;
-        for (const side of ['L', 'R']) {
-          if (side === h.side || !c[side]) continue;
-          if (this._canReachMeet(c[side].to, meet)) { found = true; break; }
-        }
-        if (found) {
-          out.push({ meet, histIndex: i, cardId: h.card });
+        if (!this.card(h.card)) continue;
+        const path = this._search(h.snap, h.card, this._selOf(h, i), { meet }, SEARCH_BUDGET, memo);
+        if (path) {
+          out.push({ meet, histIndex: i, cardId: h.card, path });
           break;
         }
       }
@@ -377,8 +679,57 @@ export class Engine {
     return out;
   }
 
-  /** 回到 hist[idx] 那张卡，恢复当时的状态，不重复应用进卡 fx。 */
-  restore(idx) {
+  /** 本局 hist 里“当时有 ≥2 个可选项”的抉择点，最近的在前。便宜（不搜索）：UI 用它决定要不要显示“读档”。 */
+  decisionPoints() {
+    const s = this.s;
+    const out = [];
+    if (!s) return out;
+    for (let i = s.hist.length - 1; i >= 0; i--) {
+      const h = s.hist[i];
+      const c = this.card(h.card);
+      if (!c || c.end || c.screen) continue;
+      if (optionsOf(c, (h.snap && h.snap.props) || []).length < 2) continue;
+      const sel = this._selOf(h, i);
+      const full = Array.from(String(c.say || c.who || '').replace(/\s+/g, ' ').trim());
+      const text = full.slice(0, 16).join('');
+      // more：卡面不止 16 字（UI 据此加省略号；刚好 16 字的不加）
+      out.push({ histIndex: i, cardId: h.card, label: labelOf(c, sel) || '使用道具', text, more: full.length > 16, step: i + 1 });
+    }
+    return out;
+  }
+
+  /**
+   * 读档面板的数据：{points, recommend, recommendPath}。
+   * points：最近的 limit 个抉择点（最近的在前；推荐点若更早，会顶掉最后一格，保证它在表里）；
+   * recommend：最晚的一个“换个选项还能走到非死亡结局”的点的 histIndex（用 {alive:true} 沙盒搜索），没有则 -1；
+   * recommendPath：对应的选择序列（没有则 null）。
+   */
+  rewindPoints(limit) {
+    const lim = limit === undefined ? 6 : limit;
+    const all = this.decisionPoints();
+    let recommend = -1;
+    let recommendPath = null;
+    if (all.length) {
+      const memo = new Map();
+      const hist = this.s.hist;
+      for (const p of all) {
+        const h = hist[p.histIndex];
+        const path = this._search(h.snap, h.card, this._selOf(h, p.histIndex), { alive: true }, SEARCH_BUDGET, memo);
+        if (path) { recommend = p.histIndex; recommendPath = path; break; }
+      }
+    }
+    let points = all.slice(0, lim);
+    if (recommend >= 0 && lim > 0 && !points.some((p) => p.histIndex === recommend)) {
+      points = points.slice(0, lim - 1).concat(all.filter((p) => p.histIndex === recommend));
+    }
+    return { points, recommend, recommendPath };
+  }
+
+  /**
+   * 回到 hist[idx] 那张卡，恢复当时的状态，不重复应用进卡 fx。
+   * guide = {meet, path}：带上引路（options() 会给引路的下一步选项加 guide 标记）；不带则清掉引路。
+   */
+  restore(idx, guide) {
     const s = this.s;
     const h = s && s.hist[idx];
     if (!h) throw new Error('bad hist index ' + idx);
@@ -391,6 +742,9 @@ export class Engine {
     s.seen = sn.seen;
     s.card = h.card;
     s.hist = s.hist.slice(0, idx);
+    this.guide = guide && guide.meet && Array.isArray(guide.path) && guide.path.length
+      ? { meet: guide.meet, path: guide.path.map((x) => ({ card: x.card, sel: x.sel, label: x.label })), i: 0 }
+      : null;
     return this._resultNoEnd(this.card(h.card));
   }
 

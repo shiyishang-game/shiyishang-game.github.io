@@ -4,6 +4,7 @@
 //   B. 合成小剧本：道具上限、if/else 连跳上限、hist 上限、startAt / toHub 回退、nextIds 的 P 门控等边界
 //   C. 老的示例剧本（review/sample_story）：临时编译到系统临时目录再跑；编译不了就跳过，不算失败
 //   D. 编译器的数值死亡规则可达性：合成一个小剧本，临时编译，核对 unreachable / WARN / 图鉴总数（需要 python3，没有就跳过）
+//   E. 回溯修复（REWIND_SPEC_1030）：状态感知的 missed / rewindPoints / 沙盒搜索（预算、memo、纯度）/ 引路 / 旧存档无 sel 兼容 / 369 bug 路线
 import { readFileSync, writeFileSync, mkdtempSync, readdirSync, copyFileSync, unlinkSync, rmdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -80,11 +81,11 @@ function optTarget(c, sel) {
 function findRoute(st, line, target, gallery, seed0) {
   const d = distTo(st, target);
   const rnd = rng(seed0 || 7);
-  for (let attempt = 0; attempt < 5000; attempt++) {
+  for (let attempt = 0; attempt < 3000; attempt++) {
     const e = new Engine(st, { gallery: clone(gallery || fresh()), now: () => 'T' });
     let r = e.startLine(line);
     const route = [];
-    while (r.kind !== 'end' && route.length < 160) {
+    while (r.kind !== 'end' && route.length < 300) {
       const opts = e.options();
       if (!opts.length) break;
       const c = e.cur;
@@ -100,6 +101,26 @@ function findRoute(st, line, target, gallery, seed0) {
       r = e.choose(pick.sel);
     }
     if (r.kind === 'end' && r.id === target) return route;
+  }
+  return dfsRoute(st, line, target, gallery, d);
+}
+// 随机找不到时（长线、死路多）：按距离排序的深度优先 + 状态去重，每个节点从头重放
+function dfsRoute(st, line, target, gallery, d) {
+  const seen = new Set();
+  const stack = [[]];
+  for (let n = 0; stack.length && n < 20000; n++) {
+    const route = stack.pop();
+    const e = new Engine(st, { gallery: clone(gallery || fresh()), now: () => 'T' });
+    let r = e.startLine(line);
+    for (const sel of route) r = e.choose(sel);
+    if (r.kind === 'end') { if (r.id === target) return route; continue; }
+    const key = JSON.stringify([e.cur.id, e.s.m, e.s.props, e.s.flags]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const c = e.cur;
+    const dist = (o) => d[optTarget(c, o.sel)];
+    const opts = e.options().filter((o) => dist(o) !== undefined).sort((a, b) => dist(b) - dist(a));
+    for (const o of opts) stack.push(route.concat(o.sel));
   }
   return null;
 }
@@ -309,7 +330,7 @@ t('galleryView：总数 = 可玩线（含 common）的结局数 - 编译器标�
   g.ends['common.end.cai'] = 'T';
   const v = mk(g).galleryView();
   A.equal(v.total, expect); A.equal(v.got, 1);
-  A.ok(v.total >= 20 && v.total <= 40);
+  A.ok(v.total >= 20 && v.total <= 60);
   A.equal(v.groups.reduce((s, x) => s + x.ends.length, 0), v.total);
 });
 t('galleryView：common 组 = 菜是原罪 + 谁是世一上；隐藏结局带 secret 标记，其余没有；按 death/prologue/if/hidden 排序', () => {
@@ -525,13 +546,13 @@ t('if/else 连跳超过 20 次抛错', () => {
   const e = new Engine(mini(cards, 'c0'));
   A.throws(() => e.startLine('x'), /longer than 20/);
 });
-t('hist 只保留最近 80 条', () => {
+t('hist 只保留最近 300 条', () => {
   const cards = {};
-  for (let i = 0; i < 100; i++) cards['c' + i] = { ln: 'x', mode: 'text', next: 'c' + (i + 1) };
-  cards.c100 = { ln: 'x', mode: 'text', end: { kind: 'if', title: 'z' } };
+  for (let i = 0; i < 400; i++) cards['c' + i] = { ln: 'x', mode: 'text', next: 'c' + (i + 1) };
+  cards.c400 = { ln: 'x', mode: 'text', end: { kind: 'if', title: 'z' } };
   const e = new Engine(mini(cards, 'c0')); e.startLine('x');
-  for (let i = 0; i < 100; i++) e.choose('N');
-  A.equal(S(e).hist.length, 80); A.equal(S(e).hist[0].card, 'c20');
+  for (let i = 0; i < 400; i++) e.choose('N');
+  A.equal(S(e).hist.length, 300); A.equal(S(e).hist[0].card, 'c100');
 });
 t('startAt：未知卡抛错；换掉本局状态，图鉴和全局旗标不动', () => {
   const g = fresh(); g.globals.k = true; g.ends.old = 'T';
@@ -843,5 +864,431 @@ if (!built) {
     for (let k = 0; k < 300; k++) A.notEqual(randomRun(mk(null, built), 'x', rnd).id, 'x.end.weak');
   });
 }
+
+// ======================================================================
+console.log('\nE. 回溯修复：沙盒搜索 / missed / rewindPoints / 引路（REWIND_SPEC_1030）');
+// 合成剧本构造器（直接用引擎格式的 fx / 选项；mini() 只会解析道具和旗标简写，不够用）
+function syn(cards, start, opts) {
+  opts = opts || {};
+  const out = {};
+  for (const id in cards) out[id] = Object.assign({ id, ln: 'x', mode: 'text', fx: [] }, cards[id]);
+  return {
+    version: '0.0.1',
+    lines: { x: { name: 'x', meters: opts.meters || ['钱'], init: opts.init || [50], start: start || Object.keys(cards)[0],
+      deaths: opts.deaths || [{ meter: '钱', op: '<=', val: 0, end: 'dead' }], locked: false } },
+    order: ['x'], props: {}, cards: out,
+  };
+}
+const mfx = (nm, o, v) => ({ t: 'm', n: nm, o, v });
+const pfx = (nm, o) => ({ t: 'p', n: nm, o });
+const ffx = (nm, o) => ({ t: 'f', n: nm, o });
+const gfx = (nm, o) => ({ t: 'g', n: nm, o });
+const op = (tx, to, fx) => ({ t: tx, to, fx: fx || [] });
+const END_IF = { end: { kind: 'if', title: 'ok' } };
+const END_DEAD = { end: { kind: 'death', title: 'dead' } };
+
+// 例子：和 369 线 bug 同构——最后一个抉择点从静态图看能走到 X，但数值已经不够，要回到更早的点
+const stMoney = syn({
+  a: { say: '起点', L: op('花钱', 'b', [mfx('钱', '-', 30)]), R: op('攒着', 'b', [mfx('钱', '-', 5)]) },
+  b: { say: '路上', L: op('打车', 'c', [mfx('钱', '-', 30)]), R: op('走路', 'c') },
+  c: { say: '岔路口', L: op('付钱', 'm', [mfx('钱', '-', 25)]), R: op('回家', 'z') },
+  m: { meet: 'X', next: 'z', say: '遇见 X' },
+  z: END_IF,
+  dead: END_DEAD,
+}, 'a');
+const playMoney = () => { const e = mk(null, stMoney); walk(e, 'x', ['L', 'R', 'R']); return e; };
+
+t('missed（状态感知）：最后一个抉择点钱不够付，回溯点落在更早的抉择点，而不是纯图连通性认为的那个', () => {
+  const e = playMoney();
+  A.equal(S(e).card, 'z');
+  const ms = e.missed();
+  A.equal(ms.length, 1);
+  A.equal(ms[0].meet, 'X'); A.equal(ms[0].histIndex, 0); A.equal(ms[0].cardId, 'a');
+  A.deepEqual(ms[0].path.map((p) => p.card + ':' + p.sel), ['a:R', 'b:R', 'c:L']);
+  A.deepEqual(ms[0].path.map((p) => p.label), ['攒着', '走路', '付钱']);
+  // 最近的抉择点 c：换「付钱」会 钱 20-25 -> 0 直接死，search 找不到
+  const hc = S(e).hist[2];
+  A.equal(e._search(hc.snap, hc.card, hc.sel, { meet: 'X' }), null);
+  // 按 path 真能走到：restore 带引路，每步用真实 choose
+  const f = mk(null, stMoney); f.loadRun(clone(S(e)));
+  f.restore(ms[0].histIndex, { meet: 'X', path: ms[0].path });
+  for (const p of ms[0].path) { A.equal(f.cur.id, p.card); f.choose(p.sel); }
+  A.deepEqual(S(f).meets, ['X']); A.equal(f.cur.id, 'm');
+});
+t('missed：沙盒不碰引擎——状态 / 图鉴 / 事件原样，也不登记沙盒里走到的结局', () => {
+  const e = playMoney();
+  e.drainEvents();
+  const before = JSON.stringify([S(e), e.gallery, e.events]);
+  const endsBefore = Object.keys(e.gallery.ends).length;
+  e.missed(); e.rewindPoints(); e.decisionPoints();
+  A.equal(JSON.stringify([S(e), e.gallery, e.events]), before);
+  A.equal(Object.keys(e.gallery.ends).length, endsBefore);
+  // 真实剧本上同样：搜索会在沙盒里走进很多结局，图鉴一个都不能多
+  const rnd = rng(5150);
+  for (const line of playable) {
+    const e2 = mk();
+    randomRun(e2, line, rnd);
+    e2.drainEvents();
+    const snap = JSON.stringify([S(e2), e2.gallery, e2.events]);
+    e2.missed(); e2.rewindPoints();
+    A.equal(JSON.stringify([S(e2), e2.gallery, e2.events]), snap);
+  }
+});
+t('missed：if/else 门槛——旗标没点亮就走不到，回溯点是能点亮旗标的更早抉择点', () => {
+  const st = syn({
+    p: { say: 'p', L: op('拿', 'r', [ffx('key', '+')]), R: op('不拿', 'r') },
+    r: { say: 'r', L: op('进', 'q'), R: op('留', 'q2') },
+    q: { say: 'q', if: [{ t: 'f', n: 'key', neg: false }], else: 'q2', next: 'm' },
+    q2: { say: 'q2', next: 'z' },
+    m: { meet: 'X', next: 'z', say: 'X' },
+    z: END_IF,
+  }, 'p');
+  const e = mk(null, st); walk(e, 'x', ['R', 'R', 'N']);
+  A.equal(S(e).card, 'z');
+  const ms = e.missed();
+  A.equal(ms.length, 1); A.equal(ms[0].histIndex, 0);
+  A.deepEqual(ms[0].path.map((p) => p.card + ':' + p.sel), ['p:L', 'r:L', 'q:N']);
+  // 最近的抉择点 r：换「进」时旗标没点亮 -> 被 else 弹回 q2，走不到 X
+  A.equal(e._search(S(e).hist[1].snap, 'r', 'R', { meet: 'X' }), null);
+});
+t('missed：道具——持有才有 P 选项，没拿到道具的存档点不会被推荐；拿到了就是最晚的点', () => {
+  const st = syn({
+    g: { say: 'g', L: op('捡', 'h', [pfx('钥匙', '+')]), R: op('不捡', 'h') },
+    h: { say: 'h', L: op('敲门', 'z'), R: op('等着', 'z'), P: [{ p: '钥匙', t: '开门', fx: [pfx('钥匙', '-')], to: 'm' }] },
+    m: { meet: 'X', next: 'z', say: 'X' },
+    z: END_IF,
+  }, 'g');
+  const e1 = mk(null, st); walk(e1, 'x', ['R', 'R']);
+  const m1 = e1.missed();
+  A.equal(m1.length, 1); A.equal(m1[0].histIndex, 0);
+  A.deepEqual(m1[0].path.map((p) => p.sel), ['L', 'P:钥匙']);
+  A.equal(m1[0].path[1].label, '开门');
+  const e2 = mk(null, st); walk(e2, 'x', ['L', 'R']);       // 拿了钥匙但没用
+  const m2 = e2.missed();
+  A.equal(m2.length, 1); A.equal(m2[0].histIndex, 1);        // 最晚的点：h，换成「开门」
+  A.deepEqual(m2[0].path.map((p) => p.card + ':' + p.sel), ['h:P:钥匙']);
+  // 用了道具见到 X 之后：没有错过的相遇
+  const e3 = mk(null, st); walk(e3, 'x', ['L', 'P:钥匙', 'N']);
+  A.deepEqual(e3.missed(), []);
+});
+t('missed：全局旗标——沙盒里点亮的全局旗标只在沙盒副本里，真实图鉴不动；沙盒读到的是当前图鉴', () => {
+  const st = syn({
+    a: { say: 'a', L: op('好', 'q', [gfx('G1', '+')]), R: op('不', 'q') },
+    q: { say: 'q', if: [{ t: 'g', n: 'G1', neg: false }], else: 'z', next: 'm' },
+    m: { meet: 'X', next: 'z', say: 'X' },
+    z: END_IF,
+  }, 'a');
+  const e = mk(null, st); walk(e, 'x', ['R']);
+  A.equal(S(e).card, 'z');
+  const gBefore = JSON.stringify(e.gallery);
+  const ms = e.missed();
+  A.equal(ms.length, 1); A.deepEqual(ms[0].path.map((p) => p.sel), ['L', 'N']);
+  A.equal(JSON.stringify(e.gallery), gBefore); A.equal(e.gallery.globals.G1, undefined);
+  // 图鉴里已经点亮 G1：这局走「不」进 q 也看得到 X，没有错过
+  const g2 = fresh(); g2.globals.G1 = true;
+  const e2 = mk(g2, st); walk(e2, 'x', ['R', 'N']);
+  A.equal(S(e2).card, 'm');
+  A.deepEqual(e2.missed(), []);
+  // 沙盒读的是“当前图鉴”：同一个剧本，G1 已点亮时 L -> q -> m 走得到；没点亮时（q 被 else 弹回结局）走不到
+  const st2 = syn({
+    a: { say: 'a', L: op('绕路', 'q'), R: op('直走', 'z') },
+    q: { say: 'q', if: [{ t: 'g', n: 'G1', neg: false }], else: 'z', next: 'm' },
+    m: { meet: 'X', next: 'z', say: 'X' },
+    z: END_IF,
+  }, 'a');
+  const e3 = mk(g2, st2); walk(e3, 'x', ['R']);
+  A.deepEqual(e3.missed().map((x) => [x.meet, x.histIndex, x.path.map((p) => p.sel).join('')]), [['X', 0, 'LN']]);
+  const e4 = mk(null, st2); walk(e4, 'x', ['R']);
+  A.deepEqual(e4.missed(), []);
+});
+t('missed：进卡就被卡上 fx 弄死的 meet 不算（玩家根本看不到那张卡）', () => {
+  const st = syn({
+    a: { say: 'a', L: op('去', 'm'), R: op('留', 'z') },
+    m: { meet: 'X', next: 'z', say: 'X', fx: [mfx('钱', '-', 100)] },
+    z: END_IF,
+    dead: END_DEAD,
+  }, 'a');
+  const e = mk(null, st); walk(e, 'x', ['R']);
+  A.deepEqual(e.missed(), []);
+  const f = mk(null, st); const r = walk(f, 'x', ['L']);
+  A.equal(r.id, 'dead');                                      // 真实引擎里这条路就是直接死
+});
+t('missed：沙盒里会抛错的分支当作走不通，不外泄异常', () => {
+  const st = syn({
+    a: { say: 'a', L: op('坏路', 'b'), R: op('好路', 'c') },
+    b: { say: 'b', if: [{ t: 'f', n: 'nope', neg: false }], next: 'z' },   // 条件不成立又没有 else：进卡就抛错
+    c: { say: 'c', next: 'z' },
+    z: END_IF,
+  }, 'a');
+  const e = mk(null, st); walk(e, 'x', ['R', 'N']);
+  A.deepEqual(e.missed(), []);
+  A.ok(Array.isArray(e.rewindPoints().points));
+});
+t('_search：预算按“展开状态数”算，超了返回 null 且标记 truncated；刚好够就找得到；找得到的搜索不往 memo 里写', () => {
+  const cards = {};
+  const N = 30;
+  for (let i = 0; i < N; i++) cards['c' + i] = { say: 'c' + i, L: op('l', 'c' + (i + 1)), R: op('r', 'c' + (i + 1)) };
+  cards['c' + N] = { say: 'last', meet: 'X', next: 'z' };
+  cards.z = END_IF;
+  const e = mk(null, syn(cards, 'c0')); e.startLine('x');
+  const snap = e._snap();
+  const p = e._search(snap, 'c0', 'L', { meet: 'X' }, 100);
+  A.ok(p);
+  A.equal(p.length, N);                                        // c0..c29 各一步，走到 c30（带 meet 的卡）为止
+  A.equal(p[0].sel, 'R'); A.equal(p[0].card, 'c0'); A.equal(p[N - 1].card, 'c' + (N - 1));
+  A.equal(e._last.truncated, false); A.equal(e._last.found, true); A.equal(e._last.expanded, N);
+  const ok30 = e._search(snap, 'c0', 'L', { meet: 'X' }, N);   // 刚好 N 个展开状态
+  A.deepEqual(ok30, p);
+  const q = e._search(snap, 'c0', 'L', { meet: 'X' }, N - 1);
+  A.equal(q, null); A.equal(e._last.truncated, true); A.equal(e._last.expanded, N - 1); A.equal(e._last.found, false);
+  const memo = new Map();
+  A.deepEqual(e._search(snap, 'c0', 'L', { meet: 'X' }, 100, memo), p);
+  A.deepEqual(e._search(snap, 'c0', 'L', { meet: 'X' }, 100, memo), p);
+  A.equal(memo.get('m:X').size, 0);
+  // 同一个起点的 alive 目标：再多一步 N 走进 z（END_IF 是非死亡结局）
+  const pa = e._search(snap, 'c0', 'L', { alive: true }, 100);
+  A.equal(pa.length, N + 1); A.equal(pa[N].sel, 'N'); A.equal(pa[N].card, 'c' + N);
+  // 统计：每次搜索都记数
+  const s0 = e._stat.searches; e._search(snap, 'c0', 'L', { meet: 'X' }, 100);
+  A.equal(e._stat.searches, s0 + 1);
+});
+t('_search：穷尽（没超预算）才把走不通的状态记进 memo，命中后同一搜索不再展开；超预算的搜索不写 memo', () => {
+  // 死循环区：loop1 -> gate（旗标永远不亮，else 弹回 loop1）；静态图上 gate 连着 m，不会被静态剪枝；动态上永远到不了 m
+  const st = syn({
+    r: { say: 'r', L: op('进圈', 'loop1'), R: op('直走', 'z') },
+    loop1: { say: 'loop', L: op('转', 'gate'), R: op('再转', 'gate') },
+    gate: { say: 'gate', if: [{ t: 'f', n: 'nope', neg: false }], else: 'loop1', next: 'm' },
+    m: { meet: 'X', next: 'z', say: 'X' },
+    z: END_IF,
+  }, 'r');
+  const e = mk(null, st); e.startLine('x');
+  const snap = e._snap();
+  const memo = new Map();
+  A.equal(e._search(snap, 'r', 'R', { meet: 'X' }, 6000, memo), null);
+  A.equal(e._last.truncated, false);
+  A.equal(e._last.expanded, 2);                                // 起点 + loop1
+  A.equal(memo.get('m:X').size, 1);
+  // 同一个 memo 再搜一遍：loop1 已知是死状态，直接跳过，只展开起点
+  A.equal(e._search(snap, 'r', 'R', { meet: 'X' }, 6000, memo), null);
+  A.equal(e._last.expanded, 1); A.equal(memo.get('m:X').size, 1);
+  // 目标不同，memo 互不串：alive 目标另开一格
+  A.deepEqual(e._search(snap, 'r', 'L', { alive: true }, 6000, memo).map((x) => x.card + ':' + x.sel), ['r:R']);
+  A.ok(memo.has('alive'));
+  // 不带 memo：每次都完整搜
+  A.equal(e._search(snap, 'r', 'R', { meet: 'X' }, 6000), null); A.equal(e._last.expanded, 2);
+  // 超预算的搜索不往 memo 里写东西
+  const cards = {};
+  for (let i = 0; i < 12; i++) cards['d' + i] = { say: 'd' + i, L: op('l', 'd' + (i + 1)), R: op('r', 'd' + (i + 1)) };
+  cards.d12 = { say: 'end', meet: 'X', next: 'z' }; cards.z = END_IF;
+  const f = mk(null, syn(cards, 'd0')); f.startLine('x');
+  const memo2 = new Map();
+  A.equal(f._search(f._snap(), 'd0', 'L', { meet: 'X' }, 3, memo2), null);
+  A.equal(f._last.truncated, true);
+  A.equal(memo2.get('m:X').size, 0);
+  // 目标在静态图上都到不了：不展开任何状态，也不算超预算
+  A.equal(f._search(f._snap(), 'd0', 'L', { meet: 'NOPE' }, 3), null);
+  A.equal(f._last.truncated, false);
+});
+t('rewindPoints：抉择点 = 当时 ≥2 个可选项，最近在前；字段齐全；recommend 是最晚还有活路的点', () => {
+  const e = playMoney();
+  const rp = e.rewindPoints();
+  A.deepEqual(rp.points.map((p) => p.histIndex), [2, 1, 0]);
+  A.deepEqual(rp.points.map((p) => p.step), [3, 2, 1]);
+  A.deepEqual(rp.points.map((p) => p.label), ['回家', '走路', '花钱']);
+  A.deepEqual(rp.points.map((p) => p.cardId), ['c', 'b', 'a']);
+  A.deepEqual(rp.points.map((p) => p.text), ['岔路口', '路上', '起点']);
+  A.deepEqual(rp.points.map((p) => p.more), [false, false, false]);       // 短卡面：没截，UI 不加省略号
+  A.equal(rp.recommend, 0);                                   // c 换「付钱」会死，b 换「打车」会死，只有 a 换「攒着」才有活路
+  A.deepEqual(rp.recommendPath.map((p) => p.card), ['a', 'b', 'c']);       // 换「攒着」之后一路走到 z
+  A.equal(rp.recommendPath[0].sel, 'R'); A.equal(rp.recommendPath[2].sel, 'R');
+  A.deepEqual(e.decisionPoints().map((p) => p.histIndex), [2, 1, 0]);
+});
+t('rewindPoints：limit 截断；推荐点太早时顶掉最后一格，保证它在表里；没有活路时 recommend=-1', () => {
+  const cards = {};
+  cards.d0 = { say: '第一个抉择，'.repeat(6), L: op('安全', 'e'), R: op('冒险', 'd1') };
+  for (let i = 1; i <= 7; i++) cards['d' + i] = { say: 'd' + i, L: op('毒药', 'dead'), R: op('继续', i === 7 ? 'z' : 'd' + (i + 1)) };
+  cards.e = { say: 'e', next: 'z2' };
+  cards.z = END_IF; cards.z2 = { end: { kind: 'prologue', title: 'p' } };
+  cards.dead = END_DEAD;
+  const st = syn(cards, 'd0');
+  const e = mk(null, st); walk(e, 'x', ['R', 'R', 'R', 'R', 'R', 'R', 'R', 'R']);
+  A.equal(S(e).card, 'z');
+  const rp = e.rewindPoints();
+  A.equal(rp.recommend, 0);
+  A.deepEqual(rp.points.map((p) => p.histIndex), [7, 6, 5, 4, 3, 0]);   // 最近 6 个里没有推荐点 -> 最后一格换成它
+  A.equal(rp.points[5].text.length, 16);                                // 卡面前 16 字
+  A.equal(rp.points[5].more, true);                                     // 卡面 36 字，被截了 -> 加省略号
+  A.deepEqual(rp.points.slice(0, 5).map((p) => p.more), [false, false, false, false, false]);
+  A.deepEqual(e.rewindPoints(3).points.map((p) => p.histIndex), [7, 6, 0]);
+  A.deepEqual(e.rewindPoints(2).points.map((p) => p.histIndex), [7, 0]);
+  A.equal(e.decisionPoints().length, 8);
+  // 没有活路：所有抉择点的另一侧都是死
+  const st2 = syn({
+    a: { say: 'a', L: op('毒', 'dead'), R: op('走', 'b') },
+    b: { say: 'b', L: op('毒', 'dead'), R: op('走', 'z') },
+    z: END_IF, dead: END_DEAD,
+  }, 'a');
+  const f = mk(null, st2); walk(f, 'x', ['R', 'R']);
+  const rp2 = f.rewindPoints();
+  A.equal(rp2.recommend, -1); A.equal(rp2.recommendPath, null);
+  A.equal(rp2.points.length, 2);
+  // 没有任何抉择点（纯叙事）：points 为空
+  const st3 = syn({ a: { say: 'a', next: 'b' }, b: { say: 'b', next: 'z' }, z: END_IF }, 'a');
+  const g = mk(null, st3); walk(g, 'x', ['N', 'N']);
+  A.deepEqual(g.rewindPoints(), { points: [], recommend: -1, recommendPath: null });
+  A.deepEqual(g.decisionPoints(), []);
+  // 卡面恰好 16 字：不算截断（more=false，UI 不加省略号）；17 字才算；空白折成单个空格后再数；没有 say 时用 who
+  const s16 = '一二三四五六七八九十一二三四五六';
+  const st4 = syn({
+    a: { say: s16, L: op('甲', 'b'), R: op('乙', 'b') },
+    b: { say: s16 + '七', L: op('甲', 'c'), R: op('乙', 'c') },
+    c: { say: '一二三四五\n\n  六七八九    一二三四五', L: op('甲', 'd'), R: op('乙', 'd') },
+    d: { who: '只有名字', L: op('甲', 'z'), R: op('乙', 'z') },
+    z: END_IF,
+  }, 'a');
+  const h4 = mk(null, st4); walk(h4, 'x', ['L', 'L', 'L', 'L']);
+  const d4 = h4.decisionPoints();                                        // 最近的在前：d c b a
+  A.deepEqual(d4.map((p) => p.cardId), ['d', 'c', 'b', 'a']);
+  A.deepEqual(d4.map((p) => p.more), [false, false, true, false]);
+  A.deepEqual(d4.map((p) => p.text), ['只有名字', '一二三四五 六七八九 一二三四五', s16, s16]);
+  A.ok(d4.every((p) => Array.from(p.text).length <= 16));
+});
+t('hist 记录带 sel（完整选择，含 P:道具），side 仍是首字母', () => {
+  const st = syn({
+    g: { say: 'g', L: op('捡', 'h', [pfx('钥匙', '+')]), R: op('不捡', 'h') },
+    h: { say: 'h', L: op('敲门', 'z'), R: op('等着', 'z'), P: [{ p: '钥匙', t: '开门', fx: [pfx('钥匙', '-')], to: 'i' }] },
+    i: { say: 'i', next: 'z' },
+    z: END_IF,
+  }, 'g');
+  const e = mk(null, st); walk(e, 'x', ['L', 'P:钥匙', 'N']);
+  A.deepEqual(S(e).hist.map((h) => [h.sel, h.side]), [['L', 'L'], ['P:钥匙', 'P'], ['N', 'N']]);
+  const e2 = mk();
+  walk(e2, 'bin', ['N']);
+  A.equal(S(e2).hist[0].sel, 'N'); A.equal(S(e2).hist[0].side, 'N');
+  // 存档往返保留 sel
+  const e3 = mk(null, st);
+  A.equal(e3.loadRun(clone(e.exportRun())), 'ok'); A.deepEqual(S(e3).hist.map((h) => h.sel), ['L', 'P:钥匙', 'N']);
+});
+t('旧存档（hist 没有 sel）兼容：L/R/N 按 side；P 按快照推断；missed / rewindPoints 结果与新存档一致', () => {
+  const rnd = rng(8080);
+  let n1 = 0;
+  for (let k = 0; k < 120; k++) {
+    const line = playable[k % playable.length];
+    const e = mk();
+    randomRun(e, line, rnd);
+    const old = clone(S(e));
+    for (const h of old.hist) delete h.sel;
+    const f = mk(); A.equal(f.loadRun(old), 'ok');
+    let same = true;
+    for (let i = 0; i < S(f).hist.length; i++) if (f._selOf(S(f).hist[i], i) !== S(e).hist[i].sel) same = false;
+    if (!same) continue;
+    n1++;
+    A.deepEqual(f.missed(), e.missed());
+    A.deepEqual(f.rewindPoints(), e.rewindPoints());
+  }
+  A.ok(n1 >= 100, '可比较的旧存档对照至少 100 个，实际 ' + n1);
+  // 道具选项：只有一个候选道具能推断；两个候选时看下一条快照里谁没了；都推断不了就保守地排除所有 P
+  const st = syn({
+    g: { say: 'g', L: op('捡两个', 'h', [pfx('A', '+'), pfx('B', '+')]), R: op('不捡', 'h') },
+    h: { say: 'h', L: op('敲门', 'z'), R: op('等着', 'z'),
+      P: [{ p: 'A', t: '用A', fx: [pfx('A', '-')], to: 'i' }, { p: 'B', t: '用B', fx: [pfx('B', '-')], to: 'i2' }] },
+    i: { say: 'i', next: 'z' }, i2: { say: 'i2', next: 'z' },
+    z: END_IF,
+  }, 'g');
+  const e = mk(null, st); walk(e, 'x', ['L', 'P:B', 'N']);
+  const old = clone(S(e)); for (const h of old.hist) delete h.sel;
+  const f = mk(null, st); f.loadRun(old);
+  A.equal(f._selOf(S(f).hist[0], 0), 'L');
+  A.equal(f._selOf(S(f).hist[1], 1), 'P:B');                  // 下一条快照里 B 没了
+  A.equal(f._selOf(S(f).hist[2], 2), 'N');
+  const f2 = mk(null, st); f2.loadRun(old);
+  f2.s.hist[2].snap.props = ['A', 'B'];                        // 构造“推断不出”：下一状态（当前）里两个道具都在
+  f2.s.props = ['A', 'B'];
+  A.equal(f2._selOf(f2.s.hist[1], 1), 'P');
+  A.equal(isExcl(f2), true);
+  function isExcl(x) {                                         // 'P' 排除全部 P 选项：_search 从 h 出发，第一步只剩 L / R
+    const h = x.s.hist[1];
+    const path = x._search(h.snap, h.card, 'P', { alive: true });
+    return !!path && path[0].sel !== 'P:A' && path[0].sel !== 'P:B';
+  }
+});
+t('引路：restore 带 guide -> options() 在引路卡上给下一步选项加 guide=meet；按引路选前进一步，选别的 / 见到目标 / 进结局 / 换局 / 读档都清除', () => {
+  const e = playMoney();
+  const item = e.missed()[0];
+  const guide = { meet: item.meet, path: item.path };
+  const r = e.restore(item.histIndex, guide);
+  A.equal(r.id, 'a');
+  A.deepEqual(e.options().map((o) => [o.sel, o.guide]), [['L', undefined], ['R', 'X']]);
+  A.equal(e.guide.i, 0);
+  e.choose('R');                                              // 按引路选：前进一步
+  A.equal(e.guide.i, 1);
+  A.deepEqual(e.options().map((o) => [o.sel, o.guide]), [['L', undefined], ['R', 'X']]);
+  e.choose('R');
+  A.deepEqual(e.options().map((o) => [o.sel, o.guide]), [['L', 'X'], ['R', undefined]]);
+  e.choose('L');                                              // 走到 X：目标达成，引路清除
+  A.equal(S(e).card, 'm'); A.equal(e.guide, null);
+  A.ok(e.options().every((o) => !o.guide));
+  // 选了别的：清除
+  const f = playMoney(); const it2 = f.missed()[0];
+  f.restore(it2.histIndex, { meet: 'X', path: it2.path });
+  f.choose('L');
+  A.equal(f.guide, null);
+  // 带 guide 的 restore 之后再不带 guide 地 restore：清除
+  const g = playMoney(); const it3 = g.missed()[0];
+  g.restore(it3.histIndex, { meet: 'X', path: it3.path });
+  A.ok(g.guide);
+  g.choose('R'); g.restore(0);
+  A.equal(g.guide, null);
+  // 引路不写进存档，也不会被 exportRun 带出去
+  const h = playMoney(); const it4 = h.missed()[0];
+  h.restore(it4.histIndex, { meet: 'X', path: it4.path });
+  A.equal(JSON.stringify(h.exportRun()).includes('guide'), false);
+  A.equal(JSON.stringify(h.exportRun()).includes('"path"'), false);
+  // 换局 / 读档 / 回选人页：清除
+  h.startLine('x'); A.equal(h.guide, null);
+  const i = playMoney(); const it5 = i.missed()[0];
+  i.restore(it5.histIndex, { meet: 'X', path: it5.path }); i.startAt('x', 'a'); A.equal(i.guide, null);
+  i.restore; const j = playMoney(); const it6 = j.missed()[0];
+  j.restore(it6.histIndex, { meet: 'X', path: it6.path }); j.loadRun(clone(S(j))); A.equal(j.guide, null);
+  const k = mk(); walk(k, 'bin', ['N']); k.guide = { meet: 'x', path: [{ card: 'bin.003', sel: 'L', label: '' }], i: 0 }; k.toHub(); A.equal(k.guide, null);
+});
+t('引路：进入结局就清除；引路里的 sel 不在当前卡时不乱标；path 为空 / 没有 meet 的 guide 被忽略', () => {
+  const e = playMoney();
+  const item = e.missed()[0];
+  e.restore(item.histIndex, { meet: 'X', path: item.path });
+  e.choose('L');                                              // a:L 不是引路（引路是 R）-> 清除
+  A.equal(e.guide, null);
+  const f = playMoney();
+  f.restore(1, { meet: 'X', path: [{ card: 'b', sel: 'L', label: '打车' }, { card: 'c', sel: 'L', label: '付钱' }] });   // 引路走到死：b:L 钱 20-30 -> 死
+  A.deepEqual(f.options().map((o) => o.guide), ['X', undefined]);
+  const r = f.choose('L');
+  A.equal(r.kind, 'end'); A.equal(f.guide, null);
+  const g1 = playMoney();
+  g1.restore(0, { meet: 'X', path: [] }); A.equal(g1.guide, null);
+  const g2 = playMoney();
+  g2.restore(0, { path: [{ card: 'a', sel: 'R' }] }); A.equal(g2.guide, null);
+  const g3 = playMoney();
+  g3.restore(0, null); A.equal(g3.guide, null);
+  A.ok(g3.options().every((o) => !o.guide));
+  // 引路卡不是当前卡时不标记
+  const h = playMoney();
+  h.restore(0, { meet: 'X', path: [{ card: 'b', sel: 'L', label: '' }] });
+  A.ok(h.options().every((o) => !o.guide));
+});
+t('real 369 线 bug 路线：missed 给出的回溯点走得通（家底不见底），旧算法的最近一步已经是死路', () => {
+  const e = mk();
+  const r = walk(e, '369', ['N', 'L', 'L', 'R', 'N', 'R']);
+  A.equal(r.id, '369.end.broke'); A.equal(r.end.title, '卖腐乳');
+  const ms = r.end.missed();
+  const m = ms.find((x) => x.meet === '杰克爱');
+  A.ok(m); A.ok(m.histIndex < S(e).hist.length - 1);
+  A.equal(m.cardId, '369.002c'); A.equal(m.path[0].label, '看看就好');
+  const last = S(e).hist[S(e).hist.length - 1];
+  A.equal(e._search(last.snap, last.card, last.sel, { meet: '杰克爱' }), null);
+  e.restore(m.histIndex, { meet: m.meet, path: m.path });
+  let rr;
+  for (const p of m.path) { A.ok(e.options().some((o) => o.sel === p.sel && o.guide === '杰克爱')); rr = e.choose(p.sel); A.notEqual(rr.kind, 'end'); }
+  A.equal(rr.id, '369.008'); A.ok(S(e).meets.includes('杰克爱')); A.ok(S(e).m.家底 > 0);
+});
 
 console.log('\n' + (process.exitCode ? 'FAILED' : 'ALL PASSED') + ' (' + n + ' tests passed, ' + asserts + ' assertions' + (skipped ? ', 示例剧本部分已跳过' : '') + ')');

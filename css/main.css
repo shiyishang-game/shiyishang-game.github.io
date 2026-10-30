@@ -289,6 +289,27 @@ button { font: inherit; color: inherit; cursor: pointer; }
     0 0 10px var(--pink), 0 0 22px var(--pink);
   pointer-events: none;
 }
+/* 原剧截图（素材 key 以 d/e 开头）左上角的小角标「原剧第N集」。贴在图片里面：名牌 tag 在左下角，数值栏在卡片外面，都不会被盖住 */
+.epbadge {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 2;
+  max-width: calc(100% - 16px);
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(0, 0, 0, 0.55);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: max(10px, calc(var(--cw, 358px) * 0.03));
+  line-height: 1.3;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.imgbox.missing > .epbadge { display: none; }          /* 图没加载出来（占位）就不挂集号 */
 
 .card.full .card-full { position: absolute; inset: 0; width: 100%; height: 100%; }
 .card.full .shade {
@@ -437,6 +458,31 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 @media (prefers-reduced-motion: reduce) {
   .optbar.nudge .choice { animation: cglow 0.9s ease-out; }
+}
+/* 引路：该选的那个选项右上角挂一个金色小角标「✦ 通往X」。角标是按钮外面的兄弟节点，压在按钮上沿的边框上，不盖按钮里的字 */
+.gwrap { position: relative; flex: 0 0 auto; width: 100%; }
+.gwrap.prop { width: auto; align-self: center; }
+.gbadge {
+  position: absolute;
+  top: -8px;
+  right: 14px;
+  z-index: 2;
+  max-width: calc(100% - 28px);
+  height: 16px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid #fff0b8;
+  background: linear-gradient(#ffd96b, #f5a623);
+  color: #3a2800;
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 0 8px rgba(245, 197, 66, 0.75);
+  cursor: pointer;
 }
 
 .bottombar { flex: 0 0 auto; display: flex; gap: 8px; padding: 6px 14px 12px; }
@@ -695,6 +741,39 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .gcell.unlocked.k-hidden { border-left-color: var(--purple); }
 .gcell.locked { color: rgba(255, 255, 255, 0.35); font-size: 22px; justify-content: center; }
 .gcell.locked.secret { font-size: 15px; letter-spacing: 3px; border-left-color: var(--purple); }
+/* 读档面板：每个抉择点一行（第几步 · 卡面前 16 字 / 你选了「X」），推荐的那行带金色角标 */
+.rewind .rrow {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.07);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: left;
+}
+.rewind .rrow:active { background: rgba(255, 255, 255, 0.18); }
+@media (hover: hover) {
+  .rewind .rrow:hover { background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.5); }
+}
+.rewind .rrow.best { border-color: var(--gold); background: rgba(245, 197, 66, 0.12); }
+.rewind .rline, .rewind .rpick { max-width: 100%; overflow-wrap: anywhere; }
+.rewind .rpick { font-size: 12.5px; color: var(--gold); }
+.rewind .rbadge {
+  padding: 1px 8px;
+  border-radius: 9px;
+  background: linear-gradient(#ffd96b, #f5a623);
+  color: #3a2800;
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
 .about-p { margin: 0 0 12px; font-size: 14px; line-height: 1.7; }
 .modal.poster { background: rgba(0, 0, 0, 0.94); }
 .posterbox { text-align: center; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
@@ -725,6 +804,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
   background: rgba(0, 0, 0, 0.82);
   font-size: 14px;
   text-align: center;
+  text-wrap: balance;      /* 折成两行时两行差不多长，不留孤字（不支持的浏览器照旧） */
   opacity: 0;
   transform: translate(-50%, 20px);
   transition: opacity 0.25s, transform 0.25s;
