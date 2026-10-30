@@ -1,0 +1,68 @@
+# 公共开场。素材键约定：
+#   d/eNN_MMSS[_t]           原剧第 NN 集 MM:SS(.t) 的截帧
+#   v/eNN_MMSS_t-MMSS_t      原剧第 NN 集的一段原声
+#   ai/xxx                   AI 写实图
+#   px/xxx                   像素图
+
+@line common
+name: 撸城
+meters: 战力 人气 家底 江湖
+init: 50 50 50 50
+start: common.001
+
+== common.001
+mode: text
+say: 三年之期已到。
+
+== common.002
+img: d/e01_0138_7
+tag: 恭迎世一上归位
+say: 恭迎世一上归位！
+sfx: v/e01_0138_7-0147_0
+
+== common.news
+screen: news
+next: common.003
+
+== common.003
+img: d/e01_0150_5
+say: 撸城，上单为王。
+  人人都想当世一上——或者，给世一上当小弟。
+L: 拜师当小弟 -> common.end.cai
+R: 我要成为世一上 -> common.cine
+
+== common.end.cai
+end: death
+title: 菜是原罪
+img: px/cai
+say: 在英雄联盟，菜是原罪。
+
+== common.cine
+screen: cinematic
+say: ai/cg1|峡谷入夜，撸城灯火未眠。
+  ai/cg2|四道身影，各自等了三年。
+  ai/cg3|一卷胶带，一把武圣之剑，一只陀螺，一顶神王冠。
+  ai/cg4|这一次，你不是旁观者。
+next: common.hchk
+
+# 四条线的序章结局都打通后，再经过这里就会进入隐藏结局。
+# 引擎里“换个世一上”按钮也应跳到 common.hchk。
+== common.hchk
+if: {{通关bin}} {{通关shy}} {{通关369}} {{通关zeus}} !{{隐藏已见}}
+else: common.select
+mode: text
+say: 四条路，你都走过了。
+  可是，到底谁才是世一上？
+next: common.hidden
+
+== common.hidden
+end: hidden
+title: 谁是世一上
+img: ai/hidden
+fx: +{{隐藏已见}}
+say: 黄金之路、武圣之力、陀螺之力、神王之力。
+  答案，不在撸城。
+  ——11 月 15 日，纽约揭晓。
+
+== common.select
+screen: select

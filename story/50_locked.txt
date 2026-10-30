@@ -1,0 +1,98 @@
+# 锁定位：经典上单，选人页显示灰色名场面照加“完整版解锁”。
+# 战绩事实只写公认的，画名场面照之前逐条再核一次。
+
+@line impact
+name: Impact
+team: SKT · 2013
+motto: S3 世界冠军上单
+portrait: sel/impact
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: impact.001
+locked: true
+
+== impact.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
+
+@line marin
+name: MaRin
+team: SKT · 2015
+motto: S5 世界冠军，总决赛 FMVP
+portrait: sel/marin
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: marin.001
+locked: true
+
+== marin.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
+
+@line duke
+name: Duke
+team: SKT · 2016
+motto: S6 世界冠军上单
+portrait: sel/duke
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: duke.001
+locked: true
+
+== duke.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
+
+@line smeb
+name: Smeb
+team: ROX · 2016
+motto: ROX 老虎的上单
+portrait: sel/smeb
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: smeb.001
+locked: true
+
+== smeb.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
+
+@line flandre
+name: Flandre
+team: EDG · 2021
+motto: S11 世界冠军上单
+portrait: sel/flandre
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: flandre.001
+locked: true
+
+== flandre.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
+
+@line kiin
+name: Kiin
+team: LCK
+motto: LCK 常青树
+portrait: sel/kiin
+meters: 战力 人气 家底 状态
+init: 50 50 50 50
+start: kiin.001
+locked: true
+
+== kiin.001
+mode: text
+say: 完整版解锁。
+end: if
+title: 敬请期待
